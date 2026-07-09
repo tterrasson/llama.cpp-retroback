@@ -5539,6 +5539,10 @@ kernel void kernel_upscale_nearest_f32(
     const int64_t i2 = tgpig.y;
     const int64_t i1 = tgpig.x;
 
+    if (args.nactive == 0) {
+        return;
+    }
+
     const int64_t i03 = i3/args.sf3;
     const int64_t i02 = i2/args.sf2;
     const int64_t i01 = i1/args.sf1;
@@ -11438,7 +11442,7 @@ kernel void kernel_cross_entropy_loss_f32(
     const float loss = retro_tg_sum(lloss, sh, sgitg, tiisg, ntg.x);
 
     if (tpitg.x == 0) {
-        atomic_fetch_add_explicit(dst, -loss / (float) args.nrows, memory_order_relaxed);
+        atomic_fetch_add_explicit(dst, -loss / (float) args.nactive, memory_order_relaxed);
     }
 }
 
@@ -11477,11 +11481,14 @@ kernel void kernel_cross_entropy_loss_back_f32(
     const float sum = retro_tg_sum(lsum, sh, sgitg, tiisg, ntg.x);
 
     const float sm_scale = 1.0f / sum;
-    const float d_by_nr  = grad[0] / (float) args.nrows;
+    float label_sum = 0.0f;
+    for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) label_sum += s1[i00];
+    const bool active = retro_tg_sum(label_sum, sh, sgitg, tiisg, ntg.x) != 0.0f;
+    const float d_by_nr  = active ? grad[0] / (float) args.nactive : 0.0f;
 
     for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
         const float sm = exp(s0[i00] - max_val) * sm_scale;
-        d[i00] = (sm - s1[i00]) * d_by_nr;
+        d[i00] = active ? (sm - s1[i00]) * d_by_nr : 0.0f;
     }
 }
 
