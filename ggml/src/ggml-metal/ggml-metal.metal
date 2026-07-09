@@ -11325,6 +11325,47 @@ kernel void kernel_out_prod_f32(
     dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
 }
 
+// retro delta: out-prod with a Q8_0-quantized src0 (the activation-gradient
+// dx = out_prod(W, dy) case, where W is a quantized model weight). Same flat
+// dispatch as kernel_out_prod_f32, but src0 strides s01/s02/s03 are in BYTES
+// and each element is dequantized in place: within row k, element i0 lives in
+// block i0/QK8_0 at lane i0%QK8_0, value d * qs.
+kernel void kernel_out_prod_q8_0(
+        constant ggml_metal_kargs_out_prod & args,
+        device const char  * src0,
+        device const float * src1,
+        device       float * dst,
+        uint gid[[thread_position_in_grid]]) {
+    const int64_t total = args.ne0 * args.ne1 * args.ne2 * args.ne3;
+    if ((int64_t) gid >= total) {
+        return;
+    }
+
+    const int64_t i0 = (int64_t) gid % args.ne0;
+    int64_t r        = (int64_t) gid / args.ne0;
+    const int64_t i1 = r % args.ne1;
+    r /= args.ne1;
+    const int64_t i2 = r % args.ne2;
+    const int64_t i3 = r / args.ne2;
+
+    const int64_t i02 = i2 / args.dps2;
+    const int64_t i03 = i3 / args.dps3;
+
+    const int64_t ib = i0 / QK8_0; // block index within a src0 row
+    const short   iq = i0 % QK8_0; // lane within the block
+
+    device const char * base0 = src0 + i02*args.s02 + i03*args.s03;
+    const int64_t off1 = i1*args.s10 + i2*args.s12 + i3*args.s13;
+
+    float acc = 0.0f;
+    for (int64_t k = 0; k < args.ne01; ++k) {
+        device const block_q8_0 * blk = (device const block_q8_0 *)(base0 + k*args.s01) + ib;
+        acc += ((float) blk->d * blk->qs[iq]) * src1[off1 + k*args.s11];
+    }
+
+    dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
+}
+
 // retro delta: threadgroup-wide sum/max over per-simdgroup partials. Safe for any
 // threadgroup size (including a partial trailing simdgroup): only simdgroup 0
 // combines the partials, then the total is re-broadcast through shared memory.
