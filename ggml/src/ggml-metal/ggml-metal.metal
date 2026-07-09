@@ -5539,10 +5539,6 @@ kernel void kernel_upscale_nearest_f32(
     const int64_t i2 = tgpig.y;
     const int64_t i1 = tgpig.x;
 
-    if (args.nactive == 0) {
-        return;
-    }
-
     const int64_t i03 = i3/args.sf3;
     const int64_t i02 = i2/args.sf2;
     const int64_t i01 = i1/args.sf1;
@@ -11480,6 +11476,12 @@ kernel void kernel_cross_entropy_loss_f32(
     threadgroup float sh[32];
 
     const int64_t i1 = tgpig.x;
+
+    // A batch containing only ignored labels has a zero loss.  Avoid dividing
+    // by zero while leaving the zero-filled destination unchanged.
+    if (args.nactive == 0) {
+        return;
+    }
 
     device const float * s0 = logits + i1*args.ne00;
     device const float * s1 = labels + i1*args.ne00;
