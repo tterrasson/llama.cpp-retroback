@@ -4971,8 +4971,7 @@ int ggml_metal_op_rms_norm_back(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-// retro delta: out-prod (weight-gradient GEMM). Correctness-first flat dispatch:
-// one thread per dst element, sequential reduction over the contraction dim.
+// retro delta: out-prod (weight-gradient GEMM), tiled across both output axes.
 int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -5014,10 +5013,11 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
     if (is_k_quant) {
-        const int64_t total = ne0 * ne1 * ne2 * ne3 / outputs_per_thread;
-        const int nth = std::min<int64_t>(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), total);
-        const int64_t n = (total + nth - 1) / nth;
-        ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
+        constexpr int tile = 8;
+        const int64_t ne0_chunks = ne0 / outputs_per_thread;
+        ggml_metal_encoder_dispatch_threadgroups(
+                enc, (ne0_chunks + tile - 1)/tile, (ne1 + tile - 1)/tile, ne2*ne3,
+                tile, tile, 1);
     } else {
         constexpr int tile = 8;
         ggml_metal_encoder_dispatch_threadgroups(

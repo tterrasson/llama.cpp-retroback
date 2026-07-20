@@ -11630,23 +11630,22 @@ kernel void kernel_out_prod_k(
         device const char  * src0,
         device const float * src1,
         device       float * dst,
-        uint gid[[thread_position_in_grid]]) {
-    const int64_t ne0_chunks = args.ne0 / 16;
-    const int64_t total = ne0_chunks * args.ne1 * args.ne2 * args.ne3;
-    if ((int64_t) gid >= total) {
-        return;
-    }
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tid[[thread_position_in_threadgroup]]) {
+    constexpr int TILE = 8;
+    threadgroup float4x4 tile0[TILE];
+    threadgroup float tile1[TILE];
 
-    const int64_t ic = (int64_t) gid % ne0_chunks;
-    int64_t r        = (int64_t) gid / ne0_chunks;
-    const int64_t i1 = r % args.ne1;
-    r /= args.ne1;
-    const int64_t i2 = r % args.ne2;
-    const int64_t i3 = r / args.ne2;
+    const int64_t ic = ((int64_t) tgpig.x*TILE + tid.x);
+    const int64_t i1 =  (int64_t) tgpig.y*TILE + tid.y;
+    const int64_t i2 =  (int64_t) tgpig.z % args.ne2;
+    const int64_t i3 =  (int64_t) tgpig.z / args.ne2;
+    const int64_t i0 = ic * 16;
+    const bool valid0 = i0 < args.ne0;
+    const bool valid = valid0 && i1 < args.ne1 && i3 < args.ne3;
 
     const int64_t i02 = i2 / args.dps2;
     const int64_t i03 = i3 / args.dps3;
-    const int64_t i0  = ic * 16;
     const int64_t ib  = i0 / QK_K;
     const short   il  = (i0 % QK_K) / 16;
 
@@ -11655,12 +11654,29 @@ kernel void kernel_out_prod_k(
 
     float4x4 acc(0.0f);
     for (int64_t k = 0; k < args.ne01; ++k) {
-        float4x4 values;
-        dequantize_func((device const block_q *)(base0 + k*args.s01) + ib, il, values);
-        acc += values * src1[off1 + k*args.s11];
+        // One row of the group cooperatively dequantizes eight adjacent
+        // 16-value chunks. The other seven rows reuse those values for their
+        // independent dst rows instead of repeating the same block decode.
+        if (tid.y == 0) {
+            float4x4 values(0.0f);
+            if (valid0) {
+                dequantize_func((device const block_q *)(base0 + k*args.s01) + ib, il, values);
+            }
+            tile0[tid.x] = values;
+        }
+        if (tid.x == 0) {
+            tile1[tid.y] = i1 < args.ne1 ? src1[off1 + k*args.s11] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (valid) {
+            acc += tile0[tid.x] * tile1[tid.y];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    *((device float4x4 *)(dst + i0 + i1*args.s1 + i2*args.s2 + i3*args.s3)) = acc;
+    if (valid) {
+        *((device float4x4 *)(dst + i0 + i1*args.s1 + i2*args.s2 + i3*args.s3)) = acc;
+    }
 }
 
 typedef decltype(kernel_out_prod_k<block_q2_K, dequantize_q2_K>) out_prod_k_t;

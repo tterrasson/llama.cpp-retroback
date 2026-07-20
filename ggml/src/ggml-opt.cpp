@@ -24,6 +24,14 @@ struct ggml_opt_dataset {
     size_t  nbs_data    = -1;
     size_t  nbs_labels  = -1;
 
+    // Optional second caller-owned segment. `data`/`labels` describe the
+    // logical combined shape while shard reads switch backing pointers at
+    // split_shard. Internal datasets and single external views leave these
+    // fields unset.
+    void *  data_second   = nullptr;
+    void *  labels_second = nullptr;
+    int64_t split_shard   = -1;
+
     std::vector<int64_t> permutation;
 };
 
@@ -172,6 +180,36 @@ ggml_opt_dataset_t ggml_opt_dataset_init_external(
     return result;
 }
 
+ggml_opt_dataset_t ggml_opt_dataset_init_external_split(
+        enum ggml_type type_data,
+        enum ggml_type type_label,
+        int64_t        ne_datapoint,
+        int64_t        ne_label,
+        int64_t        ndata_first,
+        int64_t        ndata_second,
+        int64_t        ndata_shard,
+        void *         data_first,
+        void *         labels_first,
+        void *         data_second,
+        void *         labels_second) {
+    GGML_ASSERT(ne_datapoint > 0 && ndata_first > 0 && ndata_second > 0 && ndata_shard > 0);
+    GGML_ASSERT(ndata_first <= INT64_MAX - ndata_second);
+    GGML_ASSERT(ndata_first % ndata_shard == 0);
+    GGML_ASSERT(ndata_second % ndata_shard == 0);
+    GGML_ASSERT(data_first && data_second);
+    GGML_ASSERT((ne_label == 0) == (labels_first == nullptr));
+    GGML_ASSERT((ne_label == 0) == (labels_second == nullptr));
+
+    ggml_opt_dataset_t result = ggml_opt_dataset_init_external(
+            type_data, type_label, ne_datapoint, ne_label,
+            ndata_first + ndata_second, ndata_shard,
+            data_first, labels_first);
+    result->data_second   = data_second;
+    result->labels_second = labels_second;
+    result->split_shard   = ndata_first / ndata_shard;
+    return result;
+}
+
 void ggml_opt_dataset_free(ggml_opt_dataset_t dataset) {
     if (dataset->buf) {
         ggml_backend_buffer_free(dataset->buf);
@@ -190,6 +228,19 @@ struct ggml_tensor * ggml_opt_dataset_data(ggml_opt_dataset_t dataset) {
 
 struct ggml_tensor * ggml_opt_dataset_labels(ggml_opt_dataset_t dataset) {
     return dataset->labels;
+}
+
+static const char * ggml_opt_dataset_shard_ptr(
+        ggml_opt_dataset_t dataset,
+        bool               labels,
+        int64_t            ishard) {
+    const size_t nbs = labels ? dataset->nbs_labels : dataset->nbs_data;
+    const void * first = labels ? dataset->labels->data : dataset->data->data;
+    const void * second = labels ? dataset->labels_second : dataset->data_second;
+    if (second && ishard >= dataset->split_shard) {
+        return (const char *) second + (ishard - dataset->split_shard)*nbs;
+    }
+    return (const char *) first + ishard*nbs;
 }
 
 void ggml_opt_dataset_shuffle(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dataset, int64_t idata) {
@@ -226,14 +277,14 @@ void ggml_opt_dataset_get_batch(ggml_opt_dataset_t dataset, struct ggml_tensor *
     for (int64_t ishard_batch = 0; ishard_batch < shards_per_batch; ++ishard_batch) {
         const int64_t ishard = dataset->permutation[ibatch*shards_per_batch + ishard_batch];
 
-        const char * ptr_data = (const char *) dataset->data->data + ishard*dataset->nbs_data;
+        const char * ptr_data = ggml_opt_dataset_shard_ptr(dataset, false, ishard);
         ggml_backend_tensor_set(data_batch, ptr_data, ishard_batch*dataset->nbs_data, dataset->nbs_data);
 
         if (!labels_batch) {
             continue;
         }
 
-        const char * ptr_labels = (const char *) dataset->labels->data + ishard*dataset->nbs_labels;
+        const char * ptr_labels = ggml_opt_dataset_shard_ptr(dataset, true, ishard);
         ggml_backend_tensor_set(labels_batch, ptr_labels, ishard_batch*dataset->nbs_labels, dataset->nbs_labels);
     }
 }
@@ -249,7 +300,7 @@ void ggml_opt_dataset_get_batch_host(ggml_opt_dataset_t dataset, void * data_bat
     for (int64_t ishard_batch = 0; ishard_batch < shards_per_batch; ++ishard_batch) {
         const int64_t ishard = dataset->permutation[ibatch*shards_per_batch + ishard_batch];
 
-        const char * ptr_data       = (const char *) dataset->data->data + ishard      *dataset->nbs_data;
+        const char * ptr_data       = ggml_opt_dataset_shard_ptr(dataset, false, ishard);
         char       * ptr_data_batch = (char       *) data_batch          + ishard_batch*dataset->nbs_data;
         memcpy(ptr_data_batch, ptr_data, dataset->nbs_data);
 
@@ -257,7 +308,7 @@ void ggml_opt_dataset_get_batch_host(ggml_opt_dataset_t dataset, void * data_bat
             continue;
         }
 
-        const char * ptr_labels       = (const char *) dataset->labels->data + ishard      *dataset->nbs_labels;
+        const char * ptr_labels       = ggml_opt_dataset_shard_ptr(dataset, true, ishard);
         char       * ptr_labels_batch = (char       *) labels_batch          + ishard_batch*dataset->nbs_labels;
         memcpy(ptr_labels_batch, ptr_labels, dataset->nbs_labels);
     }
