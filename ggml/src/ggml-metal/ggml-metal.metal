@@ -11343,14 +11343,87 @@ kernel void kernel_ssm_conv_back_f32(
     dst[gid] = acc;
 }
 
-// retro delta: SSM scan backward. One thread handles one (sequence, token,
-// head, channel, state) tuple. It recomputes the scalar forward trajectory and
-// reverse adjoint, then atomically contributes to the packed gradients shared
-// across states, channels, heads, or sequences. This deliberately trades extra
-// arithmetic for bounded memory and a race-free correctness-first kernel.
-kernel void kernel_ssm_scan_back_f32(
+// retro delta: SSM scan backward, pass 0. One threadgroup per (head,
+// sequence) chain replays the forward recurrence once over the whole sequence
+// and snapshots the state at every chunk boundary (checkpoints), so the grad
+// pass can recompute each chunk independently. It also seeds the lambda carry
+// with the gradient of the final state. Same sequential recurrence as the CPU
+// reference: bit-identical states, O(T) work instead of the former O(T^2)
+// per-element recomputation.
+kernel void kernel_ssm_scan_back_ckpt_f32(
         constant ggml_metal_kargs_ssm_scan_back & args,
         device const char  * src0,
+        device const char  * src1,
+        device const char  * src2,
+        device const char  * src3,
+        device const char  * src4,
+        device const char  * src6,
+        device const float * src7,
+        device       float * ckpt,
+        device       float * carry,
+        uint2 tgpig[[threadgroup_position_in_grid]],
+        uint  tid [[thread_index_in_threadgroup]],
+        uint2 ntg [[threads_per_threadgroup]]) {
+    const uint tptg = ntg.x;
+    const int64_t nc = args.d_state;
+    const int64_t nr = args.head_dim;
+    const int64_t nh = args.n_head;
+    const int64_t nt = args.n_seq_tokens;
+    const int64_t tc = args.tc;
+
+    const int64_t h = tgpig.x;
+    const int64_t s = tgpig.y;
+    const int64_t g = h/(args.n_head/args.n_group);
+    const int64_t cs = nc*nr;
+    const int64_t ch = s*nh + h;
+
+    const int32_t slot = *(device const int32_t *) (src6 + s*args.nb60);
+
+    device float * ckpt_c = ckpt + ch*cs;   // chunk-major: [chunk][chain][cs]
+    device float * carry_c = carry + ch*cs;
+
+    for (int64_t pair = tid; pair < cs; pair += tptg) {
+        const int64_t p = pair / nc;
+        const int64_t n = pair % nc;
+
+        const float A = *(device const float *) (src3 +
+                (args.n_A0 == 1 ? 0 : n*args.nb30) + h*args.nb31);
+
+        // the reverse adjoint of the last token starts from the gradient of
+        // the final state
+        carry_c[pair] = src7[args.off_dt + s*(cs*nh) + h*cs + pair];
+
+        float state = *(device const float *) (src0 + n*args.nb00 +
+                p*args.nb01 + h*args.nb02 + (int64_t) slot*args.nb03);
+
+        for (int64_t t = 0; t < nt; ++t) {
+            if (t % tc == 0) {
+                ckpt_c[(t/tc)*nh*args.n_seqs*cs + pair] = state;
+            }
+            const float dtv = *(device const float *) (src2 +
+                    h*args.nb20 + t*args.nb21 + s*args.nb22);
+            const float dsp = dtv <= 20.0f ? log(1.0f + exp(dtv)) : dtv;
+            const float x = *(device const float *) (src1 +
+                    p*args.nb10 + h*args.nb11 + t*args.nb12 + s*args.nb13);
+            const float B = *(device const float *) (src4 +
+                    n*args.nb40 + g*args.nb41 + t*args.nb42 + s*args.nb43);
+            state = state*exp(dsp*A) + B*x*dsp;
+        }
+    }
+}
+
+// retro delta: SSM scan backward, pass 1. One threadgroup per (head,
+// sequence) chain, dispatched once per chunk of args.tc tokens from the last
+// chunk to the first (encoder memory barriers carry the lambda between
+// chunks). The threadgroup recomputes the chunk states from its checkpoint
+// (same sequential recurrence, hence identical values), runs the reverse
+// adjoint inside the chunk, then emits the packed gradients. Cross-pair sums
+// are gathered with one writer per output cell (threadgroup atomic floats do
+// not support fetch-add in MSL): grad_x/grad_dt are exclusive to the chain
+// and written directly, grad_B/grad_C combine the per-cell partial across
+// heads of a group through a single device atomic per cell and chunk.
+kernel void kernel_ssm_scan_back_grad_f32(
+        constant ggml_metal_kargs_ssm_scan_back & args,
         device const char  * src1,
         device const char  * src2,
         device const char  * src3,
@@ -11359,111 +11432,180 @@ kernel void kernel_ssm_scan_back_f32(
         device const char  * src6,
         device const float * src7,
         device       float * dst,
-        uint gid[[thread_position_in_grid]]) {
-    const int64_t total = args.d_state * args.head_dim * args.n_head *
-                          args.n_seq_tokens * args.n_seqs;
-    if ((int64_t) gid >= total) {
-        return;
-    }
+        device       float * traj,
+        device       float * lam,
+        device const float * ckpt,
+        device       float * carry,
+        threadgroup  float * red [[threadgroup(0)]],
+        uint2 tgpig[[threadgroup_position_in_grid]],
+        uint  tid [[thread_index_in_threadgroup]],
+        uint2 ntg [[threads_per_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const uint tptg = ntg.x;
+    const int64_t nc = args.d_state;
+    const int64_t nr = args.head_dim;
+    const int64_t nh = args.n_head;
+    const int64_t ng = args.n_group;
+    const int64_t nt = args.n_seq_tokens;
+    const int64_t tc = args.tc;
+    const int64_t lo = args.chunk_lo;
+    const int64_t hi = args.chunk_hi;
 
-    int64_t r = gid;
-    const int64_t n = r % args.d_state;
-    r /= args.d_state;
-    const int64_t p = r % args.head_dim;
-    r /= args.head_dim;
-    const int64_t h = r % args.n_head;
-    r /= args.n_head;
-    const int64_t t = r % args.n_seq_tokens;
-    const int64_t s = r / args.n_seq_tokens;
+    const int64_t h = tgpig.x;
+    const int64_t s = tgpig.y;
+    const int64_t g = h/(nh/ng);
+    const int64_t cs = nc*nr;
+    const int64_t chains = nh*args.n_seqs;
+    const int64_t ch = s*nh + h;
+    const int64_t ich = lo/tc;
 
-    const int64_t g = h / (args.n_head / args.n_group);
     const int32_t slot = *(device const int32_t *) (src6 + s*args.nb60);
-    const float A = *(device const float *) (src3 +
-            (args.n_A0 == 1 ? 0 : n*args.nb30) + h*args.nb31);
 
-    // Recompute state_t and retain state_{t-1} for the A gradient.
-    float state = *(device const float *) (src0 + n*args.nb00 +
-            p*args.nb01 + h*args.nb02 + (int64_t) slot*args.nb03);
-    float prev = state;
-    for (int64_t u = 0; u <= t; ++u) {
-        const float dtv = *(device const float *) (src2 +
-                h*args.nb20 + u*args.nb21 + s*args.nb22);
-        const float dsp = dtv <= 20.0f ? log(1.0f + exp(dtv)) : dtv;
-        const float aval = exp(dsp*A);
-        const float x = *(device const float *) (src1 +
-                p*args.nb10 + h*args.nb11 + u*args.nb12 + s*args.nb13);
-        const float B = *(device const float *) (src4 +
-                n*args.nb40 + g*args.nb41 + u*args.nb42 + s*args.nb43);
-        prev = state;
-        state = prev*aval + B*x*dsp;
-    }
+    device       float * traj_c  = traj  + ch*cs;  // token-major: [tc][chain][cs]
+    device       float * lam_c   = lam   + ch*cs;
+    device const float * ckpt_c  = ckpt  + (ich*chains + ch)*cs;
+    device       float * carry_c = carry + ch*cs;
 
-    // Recompute lambda_t from the final-state gradient and later output grads.
-    const int64_t n_x = args.off_dt;
-    const int64_t final_off = n_x + s*(args.d_state*args.head_dim*args.n_head) +
-                              h*(args.d_state*args.head_dim) + p*args.d_state + n;
-    float lambda = 0.0f;
-    for (int64_t u = args.n_seq_tokens - 1; u >= t; --u) {
-        const float dy = src7[p + h*args.head_dim +
-                u*args.head_dim*args.n_head +
-                s*args.n_seq_tokens*args.head_dim*args.n_head];
-        const float C = *(device const float *) (src5 +
-                n*args.nb50 + g*args.nb51 + u*args.nb52 + s*args.nb53);
-        float future;
-        if (u == args.n_seq_tokens - 1) {
-            future = src7[final_off];
-        } else {
-            const float dt_next = *(device const float *) (src2 +
-                    h*args.nb20 + (u + 1)*args.nb21 + s*args.nb22);
-            const float dsp_next = dt_next <= 20.0f ? log(1.0f + exp(dt_next)) : dt_next;
-            future = exp(dsp_next*A)*lambda;
+    // phase A: recompute the chunk states from the checkpoint
+    for (int64_t pair = tid; pair < cs; pair += tptg) {
+        const int64_t p = pair / nc;
+        const int64_t n = pair % nc;
+
+        const float A = *(device const float *) (src3 +
+                (args.n_A0 == 1 ? 0 : n*args.nb30) + h*args.nb31);
+
+        float state = ckpt_c[pair];
+        for (int64_t t = lo; t < hi; ++t) {
+            const float dtv = *(device const float *) (src2 +
+                    h*args.nb20 + t*args.nb21 + s*args.nb22);
+            const float dsp = dtv <= 20.0f ? log(1.0f + exp(dtv)) : dtv;
+            const float x = *(device const float *) (src1 +
+                    p*args.nb10 + h*args.nb11 + t*args.nb12 + s*args.nb13);
+            const float B = *(device const float *) (src4 +
+                    n*args.nb40 + g*args.nb41 + t*args.nb42 + s*args.nb43);
+            state = state*exp(dsp*A) + B*x*dsp;
+            traj_c[(t - lo)*chains*cs + pair] = state;
         }
-        lambda = dy*C + future;
     }
+    threadgroup_barrier(mem_flags::mem_device);
 
-    const float dtv = *(device const float *) (src2 +
-            h*args.nb20 + t*args.nb21 + s*args.nb22);
-    const float dsp = dtv <= 20.0f ? log(1.0f + exp(dtv)) : dtv;
-    const float sig = dtv > 20.0f ? 1.0f : 1.0f/(1.0f + exp(-dtv));
-    const float aval = exp(dsp*A);
-    const float x = *(device const float *) (src1 +
-            p*args.nb10 + h*args.nb11 + t*args.nb12 + s*args.nb13);
-    const float B = *(device const float *) (src4 +
-            n*args.nb40 + g*args.nb41 + t*args.nb42 + s*args.nb43);
-    const float dy = src7[p + h*args.head_dim +
-            t*args.head_dim*args.n_head +
-            s*args.n_seq_tokens*args.head_dim*args.n_head];
+    // phase B: reverse adjoint over the chunk, seeded by the lambda carry of
+    // the following chunk; per-pair A gradient and initial-state gradient
+    for (int64_t pair = tid; pair < cs; pair += tptg) {
+        const int64_t p = pair / nc;
+        const int64_t n = pair % nc;
 
-    const int64_t ix  = p + h*args.head_dim +
-                        t*args.head_dim*args.n_head +
-                        s*args.n_seq_tokens*args.head_dim*args.n_head;
-    const int64_t idt = args.off_dt + h + t*args.n_head +
-                        s*args.n_head*args.n_seq_tokens;
-    const int64_t iA  = args.off_A + (args.n_A0 == 1 ? h : n + h*args.d_state);
-    const int64_t iB  = args.off_B + n + g*args.d_state +
-                        t*args.d_state*args.n_group +
-                        s*args.d_state*args.n_group*args.n_seq_tokens;
-    const int64_t iC  = args.off_C + n + g*args.d_state +
-                        t*args.d_state*args.n_group +
-                        s*args.d_state*args.n_group*args.n_seq_tokens;
+        const float A = *(device const float *) (src3 +
+                (args.n_A0 == 1 ? 0 : n*args.nb30) + h*args.nb31);
 
-    atomic_fetch_add_explicit((device atomic_float *) dst + ix,
-            dsp*lambda*B, memory_order_relaxed);
-    atomic_fetch_add_explicit((device atomic_float *) dst + idt,
-            (lambda*prev*A*aval + x*lambda*B)*sig, memory_order_relaxed);
-    atomic_fetch_add_explicit((device atomic_float *) dst + iA,
-            lambda*prev*dsp*aval, memory_order_relaxed);
-    atomic_fetch_add_explicit((device atomic_float *) dst + iB,
-            lambda*x*dsp, memory_order_relaxed);
-    atomic_fetch_add_explicit((device atomic_float *) dst + iC,
-            dy*state, memory_order_relaxed);
+        float f = carry_c[pair];
+        float accA = 0.0f;
+        for (int64_t t = hi - 1; t >= lo; --t) {
+            const float dtv = *(device const float *) (src2 +
+                    h*args.nb20 + t*args.nb21 + s*args.nb22);
+            const float dsp = dtv <= 20.0f ? log(1.0f + exp(dtv)) : dtv;
+            const float aval = exp(dsp*A);
+            const float dy = src7[p + h*nr + t*nr*nh + s*nt*nr*nh];
+            const float C = *(device const float *) (src5 +
+                    n*args.nb50 + g*args.nb51 + t*args.nb52 + s*args.nb53);
+            const float l = dy*C + f;
+            lam_c[(t - lo)*chains*cs + pair] = l;
+            const float prev = t == lo ? ckpt_c[pair]
+                                       : traj_c[(t - 1 - lo)*chains*cs + pair];
+            accA += l*prev*dsp*aval;
+            f = aval*l;
+            if (t == 0) {
+                const int64_t is0 = args.off_s + n + p*nc + h*cs +
+                                    (int64_t) slot*cs*nh;
+                atomic_fetch_add_explicit((device atomic_float *) dst + is0,
+                        f, memory_order_relaxed);
+            }
+        }
+        carry_c[pair] = f;
+        const int64_t iA = args.off_A + (args.n_A0 == 1 ? h : n + h*nc);
+        atomic_fetch_add_explicit((device atomic_float *) dst + iA,
+                accA, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
 
-    if (t == 0) {
-        const int64_t is0 = args.off_s + n + p*args.d_state +
-                            h*args.d_state*args.head_dim +
-                            (int64_t) slot*args.d_state*args.head_dim*args.n_head;
-        atomic_fetch_add_explicit((device atomic_float *) dst + is0,
-                aval*lambda, memory_order_relaxed);
+    // phase C: per-token outputs. grad_dt sums over every (n, p) pair, so each
+    // thread accumulates a partial over its pairs which is then reduced across
+    // simdgroups; grad_x/grad_B/grad_C are gathered per output cell with a
+    // single writer each.
+    const int64_t n_sg = (tptg + 31)/32;
+    for (int64_t t = lo; t < hi; ++t) {
+        const float dtv = *(device const float *) (src2 +
+                h*args.nb20 + t*args.nb21 + s*args.nb22);
+        const float dsp = dtv <= 20.0f ? log(1.0f + exp(dtv)) : dtv;
+        const float sig = dtv > 20.0f ? 1.0f : 1.0f/(1.0f + exp(-dtv));
+        const int64_t toff = (t - lo)*chains*cs;
+
+        float part = 0.0f;
+        for (int64_t pair = tid; pair < cs; pair += tptg) {
+            const int64_t p = pair / nc;
+            const int64_t n = pair % nc;
+
+            const float A = *(device const float *) (src3 +
+                    (args.n_A0 == 1 ? 0 : n*args.nb30) + h*args.nb31);
+            const float aval = exp(dsp*A);
+            const float x = *(device const float *) (src1 +
+                    p*args.nb10 + h*args.nb11 + t*args.nb12 + s*args.nb13);
+            const float B = *(device const float *) (src4 +
+                    n*args.nb40 + g*args.nb41 + t*args.nb42 + s*args.nb43);
+            const float l = lam_c[toff + pair];
+            const float prev = t == lo ? ckpt_c[pair]
+                                       : traj_c[toff - chains*cs + pair];
+            part += l*prev*A*aval + x*l*B;
+        }
+        part = simd_sum(part);
+        if (tiisg == 0) {
+            red[sgitg] = part;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float acc = 0.0f;
+            for (int64_t i = 0; i < n_sg; ++i) {
+                acc += red[i];
+            }
+            dst[args.off_dt + h + t*nh + s*nh*nt] = acc*sig;
+        }
+
+        for (int64_t i = tid; i < nr + 2*nc; i += tptg) {
+            if (i < nr) {
+                const int64_t p = i;
+                float acc = 0.0f;
+                for (int64_t n = 0; n < nc; ++n) {
+                    const float B = *(device const float *) (src4 +
+                            n*args.nb40 + g*args.nb41 + t*args.nb42 + s*args.nb43);
+                    acc += lam_c[toff + p*nc + n]*B;
+                }
+                dst[p + h*nr + t*nr*nh + s*nt*nr*nh] = dsp*acc;
+            } else if (i < nr + nc) {
+                const int64_t n = i - nr;
+                float acc = 0.0f;
+                for (int64_t p = 0; p < nr; ++p) {
+                    const float x = *(device const float *) (src1 +
+                            p*args.nb10 + h*args.nb11 + t*args.nb12 + s*args.nb13);
+                    acc += lam_c[toff + p*nc + n]*x;
+                }
+                atomic_fetch_add_explicit((device atomic_float *) dst +
+                        args.off_B + n + g*nc + t*nc*ng + s*nc*ng*nt,
+                        acc*dsp, memory_order_relaxed);
+            } else {
+                const int64_t n = i - nr - nc;
+                float acc = 0.0f;
+                for (int64_t p = 0; p < nr; ++p) {
+                    const float dy = src7[p + h*nr + t*nr*nh + s*nt*nr*nh];
+                    acc += dy*traj_c[toff + p*nc + n];
+                }
+                atomic_fetch_add_explicit((device atomic_float *) dst +
+                        args.off_C + n + g*nc + t*nc*ng + s*nc*ng*nt,
+                        acc, memory_order_relaxed);
+            }
+        }
+        // red is reused by the next token's grad_dt reduction
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
