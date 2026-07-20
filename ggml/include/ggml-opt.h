@@ -43,6 +43,17 @@ extern "C" {
             int64_t        ne_label,     // number of elements per label
             int64_t        ndata,        // total number of datapoints/labels
             int64_t        ndata_shard); // number of datapoints/labels per shard (unit at which the dataset is shuffled/copied)
+    // View over caller-owned CPU memory. Buffers remain owned by the caller
+    // and must outlive the returned dataset.
+    GGML_API ggml_opt_dataset_t ggml_opt_dataset_init_external(
+            enum ggml_type type_data,
+            enum ggml_type type_label,
+            int64_t        ne_datapoint,
+            int64_t        ne_label,
+            int64_t        ndata,
+            int64_t        ndata_shard,
+            void *         data,
+            void *         labels);
     GGML_API void ggml_opt_dataset_free(ggml_opt_dataset_t dataset);
 
     // get underlying tensors that store the data
