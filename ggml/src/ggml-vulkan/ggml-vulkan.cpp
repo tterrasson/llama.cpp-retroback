@@ -12020,16 +12020,6 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
             }
         } break;
-    case GGML_OP_OUT_PROD:
-        {
-            // OUT_PROD shaders process one 16x16 output tile per workgroup.
-            elements = {
-                (uint32_t) dst->ne[0],
-                (uint32_t) dst->ne[1],
-                (uint32_t) (dst->ne[2] * dst->ne[3]),
-            };
-        }
-        break;
     case GGML_OP_ADD_ID:
         {
             elements = { (uint32_t)ne01, (uint32_t)ne02, 1 };
