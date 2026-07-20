@@ -54,6 +54,21 @@ extern "C" {
             int64_t        ndata_shard,
             void *         data,
             void *         labels);
+    // Logical concatenation of two caller-owned CPU-memory datasets. The
+    // split must fall on a shard boundary; batches and shuffling continue to
+    // address one global permutation without copying either segment.
+    GGML_API ggml_opt_dataset_t ggml_opt_dataset_init_external_split(
+            enum ggml_type type_data,
+            enum ggml_type type_label,
+            int64_t        ne_datapoint,
+            int64_t        ne_label,
+            int64_t        ndata_first,
+            int64_t        ndata_second,
+            int64_t        ndata_shard,
+            void *         data_first,
+            void *         labels_first,
+            void *         data_second,
+            void *         labels_second);
     GGML_API void ggml_opt_dataset_free(ggml_opt_dataset_t dataset);
 
     // get underlying tensors that store the data
