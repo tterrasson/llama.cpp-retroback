@@ -11476,18 +11476,16 @@ kernel void kernel_out_prod_f32(
         device const float * src0,
         device const float * src1,
         device       float * dst,
-        uint gid[[thread_position_in_grid]]) {
-    const int64_t total = args.ne0 * args.ne1 * args.ne2 * args.ne3;
-    if ((int64_t) gid >= total) {
-        return;
-    }
-
-    const int64_t i0 = (int64_t) gid % args.ne0;
-    int64_t r        = (int64_t) gid / args.ne0;
-    const int64_t i1 = r % args.ne1;
-    r /= args.ne1;
-    const int64_t i2 = r % args.ne2;
-    const int64_t i3 = r / args.ne2;
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tid[[thread_position_in_threadgroup]]) {
+    constexpr int TILE = 8;
+    threadgroup float tile0[TILE];
+    threadgroup float tile1[TILE];
+    const int64_t i0 = (int64_t) tgpig.x*TILE + tid.x;
+    const int64_t i1 = (int64_t) tgpig.y*TILE + tid.y;
+    const int64_t i2 = (int64_t) tgpig.z % args.ne2;
+    const int64_t i3 = (int64_t) tgpig.z / args.ne2;
+    const bool valid = i0 < args.ne0 && i1 < args.ne1 && i3 < args.ne3;
 
     const int64_t i02 = i2 / args.dps2;
     const int64_t i03 = i3 / args.dps3;
@@ -11497,10 +11495,22 @@ kernel void kernel_out_prod_f32(
 
     float acc = 0.0f;
     for (int64_t k = 0; k < args.ne01; ++k) {
-        acc += src0[off0 + k*args.s01] * src1[off1 + k*args.s11];
+        if (tid.y == 0) {
+            tile0[tid.x] = i0 < args.ne0 ? src0[off0 + k*args.s01] : 0.0f;
+        }
+        if (tid.x == 0) {
+            tile1[tid.y] = i1 < args.ne1 ? src1[off1 + k*args.s11] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (valid) {
+            acc += tile0[tid.x] * tile1[tid.y];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
+    if (valid) {
+        dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
+    }
 }
 
 // retro delta: out-prod with a Q8_0-quantized src0 (the activation-gradient
@@ -11513,18 +11523,16 @@ kernel void kernel_out_prod_q8_0(
         device const char  * src0,
         device const float * src1,
         device       float * dst,
-        uint gid[[thread_position_in_grid]]) {
-    const int64_t total = args.ne0 * args.ne1 * args.ne2 * args.ne3;
-    if ((int64_t) gid >= total) {
-        return;
-    }
-
-    const int64_t i0 = (int64_t) gid % args.ne0;
-    int64_t r        = (int64_t) gid / args.ne0;
-    const int64_t i1 = r % args.ne1;
-    r /= args.ne1;
-    const int64_t i2 = r % args.ne2;
-    const int64_t i3 = r / args.ne2;
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tid[[thread_position_in_threadgroup]]) {
+    constexpr int TILE = 8;
+    threadgroup float tile0[TILE];
+    threadgroup float tile1[TILE];
+    const int64_t i0 = (int64_t) tgpig.x*TILE + tid.x;
+    const int64_t i1 = (int64_t) tgpig.y*TILE + tid.y;
+    const int64_t i2 = (int64_t) tgpig.z % args.ne2;
+    const int64_t i3 = (int64_t) tgpig.z / args.ne2;
+    const bool valid = i0 < args.ne0 && i1 < args.ne1 && i3 < args.ne3;
 
     const int64_t i02 = i2 / args.dps2;
     const int64_t i03 = i3 / args.dps3;
@@ -11537,11 +11545,27 @@ kernel void kernel_out_prod_q8_0(
 
     float acc = 0.0f;
     for (int64_t k = 0; k < args.ne01; ++k) {
-        device const block_q8_0 * blk = (device const block_q8_0 *)(base0 + k*args.s01) + ib;
-        acc += ((float) blk->d * blk->qs[iq]) * src1[off1 + k*args.s11];
+        if (tid.y == 0) {
+            if (i0 < args.ne0) {
+                device const block_q8_0 * blk = (device const block_q8_0 *)(base0 + k*args.s01) + ib;
+                tile0[tid.x] = (float) blk->d * blk->qs[iq];
+            } else {
+                tile0[tid.x] = 0.0f;
+            }
+        }
+        if (tid.x == 0) {
+            tile1[tid.y] = i1 < args.ne1 ? src1[off1 + k*args.s11] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (valid) {
+            acc += tile0[tid.x] * tile1[tid.y];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
+    if (valid) {
+        dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
+    }
 }
 
 // Same activation-gradient path for legacy Q5_0 model weights. Q5_0 stores
@@ -11552,18 +11576,16 @@ kernel void kernel_out_prod_q5_0(
         device const char  * src0,
         device const float * src1,
         device       float * dst,
-        uint gid[[thread_position_in_grid]]) {
-    const int64_t total = args.ne0 * args.ne1 * args.ne2 * args.ne3;
-    if ((int64_t) gid >= total) {
-        return;
-    }
-
-    const int64_t i0 = (int64_t) gid % args.ne0;
-    int64_t r        = (int64_t) gid / args.ne0;
-    const int64_t i1 = r % args.ne1;
-    r /= args.ne1;
-    const int64_t i2 = r % args.ne2;
-    const int64_t i3 = r / args.ne2;
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tid[[thread_position_in_threadgroup]]) {
+    constexpr int TILE = 8;
+    threadgroup float tile0[TILE];
+    threadgroup float tile1[TILE];
+    const int64_t i0 = (int64_t) tgpig.x*TILE + tid.x;
+    const int64_t i1 = (int64_t) tgpig.y*TILE + tid.y;
+    const int64_t i2 = (int64_t) tgpig.z % args.ne2;
+    const int64_t i3 = (int64_t) tgpig.z / args.ne2;
+    const bool valid = i0 < args.ne0 && i1 < args.ne1 && i3 < args.ne3;
 
     const int64_t i02 = i2 / args.dps2;
     const int64_t i03 = i3 / args.dps3;
@@ -11576,14 +11598,30 @@ kernel void kernel_out_prod_q5_0(
 
     float acc = 0.0f;
     for (int64_t k = 0; k < args.ne01; ++k) {
-        device const block_q5_0 * blk = (device const block_q5_0 *) (base0 + k*args.s01) + ib;
-        const uint qh = *((device const uint *) blk->qh);
-        const int low = iq < 16 ? (blk->qs[il] & 0x0f) : (blk->qs[il] >> 4);
-        const int q = low | (int) (((qh >> iq) & 1u) << 4);
-        acc += ((float) blk->d * (float) (q - 16)) * src1[off1 + k*args.s11];
+        if (tid.y == 0) {
+            if (i0 < args.ne0) {
+                device const block_q5_0 * blk = (device const block_q5_0 *) (base0 + k*args.s01) + ib;
+                const uint qh = *((device const uint *) blk->qh);
+                const int low = iq < 16 ? (blk->qs[il] & 0x0f) : (blk->qs[il] >> 4);
+                const int q = low | (int) (((qh >> iq) & 1u) << 4);
+                tile0[tid.x] = (float) blk->d * (float) (q - 16);
+            } else {
+                tile0[tid.x] = 0.0f;
+            }
+        }
+        if (tid.x == 0) {
+            tile1[tid.y] = i1 < args.ne1 ? src1[off1 + k*args.s11] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (valid) {
+            acc += tile0[tid.x] * tile1[tid.y];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
+    if (valid) {
+        dst[i0 + i1*args.s1 + i2*args.s2 + i3*args.s3] = acc;
+    }
 }
 
 template<typename block_q, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>

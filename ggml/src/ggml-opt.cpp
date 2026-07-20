@@ -58,6 +58,12 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
+    // CE nodes are stamped once per ubatch. Cache their addresses across
+    // repeated calls and rebuild the cache only when ggml_opt_build replaces
+    // a dynamic graph.
+    std::vector<struct ggml_tensor *> loss_active_row_nodes;
+    uint64_t graph_generation = 0;
+    uint64_t loss_nodes_generation = UINT64_MAX;
 
     int64_t iter               = 1;
     int32_t opt_period         = 1;
@@ -129,8 +135,47 @@ ggml_opt_dataset_t ggml_opt_dataset_init(
     return result;
 }
 
+ggml_opt_dataset_t ggml_opt_dataset_init_external(
+        enum ggml_type type_data,
+        enum ggml_type type_label,
+        int64_t        ne_datapoint,
+        int64_t        ne_label,
+        int64_t        ndata,
+        int64_t        ndata_shard,
+        void *         data,
+        void *         labels) {
+    GGML_ASSERT(ne_datapoint > 0 && ndata > 0 && ndata_shard > 0);
+    GGML_ASSERT(data);
+    GGML_ASSERT((ne_label == 0) == (labels == nullptr));
+    ggml_opt_dataset_t result = new ggml_opt_dataset;
+    result->ndata       = ndata;
+    result->ndata_shard = ndata_shard;
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    result->ctx = ggml_init(params);
+    result->data = ggml_new_tensor_2d(result->ctx, type_data, ne_datapoint, ndata);
+    result->data->data = data;
+    result->nbs_data = ggml_nbytes(result->data) * ndata_shard/ndata;
+    if (ne_label > 0) {
+        result->labels = ggml_new_tensor_2d(result->ctx, type_label, ne_label, ndata);
+        result->labels->data = labels;
+        result->nbs_labels = ggml_nbytes(result->labels) * ndata_shard/ndata;
+    }
+    const int64_t nshards = ndata/ndata_shard;
+    result->permutation.resize(nshards);
+    for (int64_t i = 0; i < nshards; ++i) {
+        result->permutation[i] = i;
+    }
+    return result;
+}
+
 void ggml_opt_dataset_free(ggml_opt_dataset_t dataset) {
-    ggml_backend_buffer_free(dataset->buf);
+    if (dataset->buf) {
+        ggml_backend_buffer_free(dataset->buf);
+    }
     ggml_free(dataset->ctx);
     delete dataset;
 }
@@ -325,6 +370,7 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
+    ++opt_ctx->graph_generation;
 
     const enum ggml_opt_optimizer_type optimizer = opt_ctx->optimizer;
 
@@ -670,23 +716,29 @@ void ggml_opt_set_loss_active_rows(ggml_opt_context_t opt_ctx, int32_t n_active_
     // tensor is a SCALE node whose op_params[0] holds the (float) scale
     // factor; overwriting it would corrupt both the reported loss and the
     // gradient seed. The graph loops below reach the underlying CE nodes.
-    if (opt_ctx->loss->op == GGML_OP_CROSS_ENTROPY_LOSS) {
-        opt_ctx->loss->op_params[0] = n_active_rows;
-        opt_ctx->loss->op_params[1] = 1;
-    }
-    // Depending on the build/eval mode only a subset of the graphs exists.
-    ggml_cgraph * graphs[3] = { opt_ctx->gf, opt_ctx->gb_grad, opt_ctx->gb_opt };
-    for (ggml_cgraph * graph : graphs) {
-        if (!graph) {
-            continue;
-        }
-        for (int i = 0; i < graph->n_nodes; ++i) {
-            ggml_tensor * node = graph->nodes[i];
-            if (node->op == GGML_OP_CROSS_ENTROPY_LOSS || node->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK) {
-                node->op_params[0] = n_active_rows;
-                node->op_params[1] = 1;
+    if (opt_ctx->loss_nodes_generation != opt_ctx->graph_generation) {
+        opt_ctx->loss_active_row_nodes.clear();
+        ggml_cgraph * graphs[3] = { opt_ctx->gf, opt_ctx->gb_grad, opt_ctx->gb_opt };
+        for (ggml_cgraph * graph : graphs) {
+            if (!graph) {
+                continue;
+            }
+            for (int i = 0; i < graph->n_nodes; ++i) {
+                ggml_tensor * node = graph->nodes[i];
+                if ((node->op == GGML_OP_CROSS_ENTROPY_LOSS ||
+                            node->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK) &&
+                        std::find(opt_ctx->loss_active_row_nodes.begin(),
+                            opt_ctx->loss_active_row_nodes.end(), node) ==
+                                opt_ctx->loss_active_row_nodes.end()) {
+                    opt_ctx->loss_active_row_nodes.push_back(node);
+                }
             }
         }
+        opt_ctx->loss_nodes_generation = opt_ctx->graph_generation;
+    }
+    for (ggml_tensor * node : opt_ctx->loss_active_row_nodes) {
+        node->op_params[0] = n_active_rows;
+        node->op_params[1] = 1;
     }
 }
 
