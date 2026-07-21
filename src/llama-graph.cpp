@@ -1398,10 +1398,23 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const float adapter_scale = lora.second;
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
-        ggml_tensor * ab_cur = ggml_mul_mat(
-                ctx0, lw->b,
-                ggml_mul_mat(ctx0, lw->a, cur)
-                );
+        // retro delta: keep the LoRA branch in the activation dtype. When the
+        // adapters are stored F16 (the low-memory training dtype), feeding them
+        // straight into ggml_mul_mat forces its F32 operand to be rounded to
+        // F16 for the dot product. The forward tolerates that, but the backward
+        // routes the full-magnitude gradient through the same matmul, where the
+        // F16 round can reach +/-inf and, via the single shared gradient-norm
+        // clip, turns every parameter's update to NaN in one step. Upcasting the
+        // adapters here costs one cast per matmul and leaves both the F16
+        // storage and the stochastic-rounding F16 AdamW update untouched.
+        ggml_tensor * lora_a = lw->a->type == cur->type
+                ? lw->a
+                : ggml_cast(ctx0, lw->a, cur->type);
+        ggml_tensor * a_cur = ggml_mul_mat(ctx0, lora_a, cur);
+        ggml_tensor * lora_b = lw->b->type == a_cur->type
+                ? lw->b
+                : ggml_cast(ctx0, lw->b, a_cur->type);
+        ggml_tensor * ab_cur = ggml_mul_mat(ctx0, lora_b, a_cur);
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
@@ -1435,11 +1448,18 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const float rank  = (float) lw->b->ne[0];
         const float scale = alpha ? lora.second * alpha / rank : lora.second;
 
-        ggml_tensor * ab_cur = ggml_mul_mat_id(
-                ctx0, lw->b,
-                ggml_mul_mat_id(ctx0, lw->a, cur, ids),
-                ids
-                );
+        // retro delta: upcast F16-stored adapters to the activation dtype, as in
+        // build_lora_mm -- otherwise the mul_mat rounds its F32 operand (and, in
+        // the backward, the gradient) down to F16, which can overflow to
+        // +/-inf and poison training through the shared gradient-norm clip.
+        ggml_tensor * lora_a = lw->a->type == cur->type
+                ? lw->a
+                : ggml_cast(ctx0, lw->a, cur->type);
+        ggml_tensor * a_cur = ggml_mul_mat_id(ctx0, lora_a, cur, ids);
+        ggml_tensor * lora_b = lw->b->type == a_cur->type
+                ? lw->b
+                : ggml_cast(ctx0, lw->b, a_cur->type);
+        ggml_tensor * ab_cur = ggml_mul_mat_id(ctx0, lora_b, a_cur, ids);
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
