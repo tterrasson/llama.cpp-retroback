@@ -2671,19 +2671,35 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = inp->mctx;
 
     // store to KV cache
+    ggml_tensor * k_set = nullptr;
+    ggml_tensor * v_set = nullptr;
     {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        k_set = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        v_set = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
+
+        ggml_build_forward_expand(gf, k_set);
+        ggml_build_forward_expand(gf, v_set);
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
+    // retro delta: reading the cache buffer directly only aliases the store
+    // above, so the backward pass finds no route from the attention back to
+    // k_cur/v_cur and a LoRA on the K/V projections trains as a silent no-op.
+    // Reading the store itself restores that route. Inference keeps the plain
+    // aliasing view: the edge changes graph topology, and nothing on the decode
+    // path needs it.
+    if (!cparams.kv_differentiable) {
+        k_set = nullptr;
+        v_set = nullptr;
+    }
+
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il, k_set);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il, v_set);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
