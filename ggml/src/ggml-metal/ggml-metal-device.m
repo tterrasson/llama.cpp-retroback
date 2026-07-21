@@ -1400,6 +1400,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_DIAG:
             return true;
         case GGML_OP_OPT_STEP_ADAMW:
+            return has_simdgroup_reduction
+                    && (op->src[0]->type == GGML_TYPE_F32
+                            || op->src[0]->type == GGML_TYPE_F16)
+                    && op->src[1]->type == GGML_TYPE_F32
+                    && op->src[2]->type == GGML_TYPE_F32
+                    && op->src[3]->type == GGML_TYPE_F32
+                    && op->src[4]->type == GGML_TYPE_F32
+                    && ggml_is_contiguous(op->src[0])
+                    && ggml_is_contiguous(op->src[1])
+                    && ggml_is_contiguous(op->src[2])
+                    && ggml_is_contiguous(op->src[3]);
         case GGML_OP_OPT_STEP_SGD:
             return has_simdgroup_reduction;
         // retro delta: SILU backward for LoRA training. Elementwise F32 only,
