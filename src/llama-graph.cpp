@@ -3499,24 +3499,30 @@ void llm_graph_context::build_sampling() const {
             res->t_sampled[seq_id] = data.sampled;
             outs[1] = data.sampled;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
-        }
+        } else {
+            // Once the complete sampler chain selected a token, only that
+            // scalar is observable by llama_sampler_sample(). Exporting the
+            // intermediate probabilities, logits, and candidate ids would
+            // copy up to three full-vocabulary rows back to the host for every
+            // generated token. Keep those tensors only for a partially
+            // offloaded chain, where the remaining CPU samplers need them.
+            if (data.probs != nullptr) {
+                res->t_sampled_probs[seq_id] = data.probs;
+                outs[1] = data.probs;
+                ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+            }
 
-        if (data.probs != nullptr) {
-            res->t_sampled_probs[seq_id] = data.probs;
-            outs[1] = data.probs;
-            ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
-        }
+            if (data.logits != nullptr) {
+                res->t_sampled_logits[seq_id] = data.logits;
+                outs[1] = data.logits;
+                ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+            }
 
-        if (data.logits != nullptr) {
-            res->t_sampled_logits[seq_id] = data.logits;
-            outs[1] = data.logits;
-            ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
-        }
-
-        if (data.candidates != nullptr) {
-            res->t_candidates[seq_id] = data.candidates;
-            outs[1] = data.candidates;
-            ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+            if (data.candidates != nullptr) {
+                res->t_candidates[seq_id] = data.candidates;
+                outs[1] = data.candidates;
+                ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+            }
         }
     }
 
