@@ -1626,6 +1626,23 @@ extern "C" {
             ggml_opt_epoch_callback   callback_eval,
             const float             * label_weights);
 
+    // retro delta: one differentiable multi-sequence training graph. Prefix
+    // tokens are assigned to every sequence, so their KV and LoRA activations
+    // are shared by all completion branches and receive the summed backward.
+    LLAMA_API bool llama_opt_step_shared_prefix(
+            struct llama_context    * lctx,
+            ggml_opt_dataset_t        dataset,
+            ggml_opt_result_t         result,
+            const llama_token       * tokens,
+            const llama_token       * labels,
+            const float             * label_weights,
+            const llama_pos         * positions,
+            const llama_seq_id      * seq_ids,
+            uint32_t                  n_tokens,
+            uint32_t                  n_shared_tokens,
+            uint32_t                  n_sequences,
+            ggml_opt_epoch_callback   callback);
+
     // retro delta: training-graph preflight. Requires llama_opt_init.
     enum llama_opt_preflight_check {
         LLAMA_OPT_PREFLIGHT_MISSING_GRAD    = 0, // op has no gradient rule in ggml (dev is NULL)

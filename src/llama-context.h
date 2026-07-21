@@ -227,6 +227,19 @@ struct llama_context {
             int64_t                          ndata_in_loop,
             int64_t                          t_loop_start);
 
+    bool opt_step_shared_prefix(
+            ggml_opt_dataset_t       dataset,
+            ggml_opt_result_t        result,
+            const llama_token      * tokens,
+            const llama_token      * labels_sparse,
+            const float            * label_weights,
+            const llama_pos        * positions,
+            const llama_seq_id     * seq_ids,
+            uint32_t                 n_tokens,
+            uint32_t                 n_shared_tokens,
+            uint32_t                 n_sequences,
+            ggml_opt_epoch_callback  callback);
+
 private:
     //
     // output
