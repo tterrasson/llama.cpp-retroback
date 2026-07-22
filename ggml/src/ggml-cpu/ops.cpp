@@ -12027,6 +12027,11 @@ void ggml_compute_forward_cross_entropy_loss_back(
 // weighted, active-row-normalized loss of ggml_cross_entropy_loss applied to
 // mul_mat(w, h) with labels = weights[t]*onehot(targets[t]). See
 // docs/memory/03-vocab-logits-chunked-ce.md.
+//
+// retro delta: an optional fixed per-vocab bias (src[4] forward / src[5]
+// backward, may be NULL) is added to every z[v,t] before the log-sum-exp and
+// target-logit terms, matching ADD(MUL_MAT(w,h), bias) output heads (e.g.
+// gemma4's suppressed-token logits bias). The bias never receives a gradient.
 
 static inline void ggml_fused_ce_row_to_f32(
         const ggml_tensor * w, int64_t v, ggml_to_float_t to_float,
@@ -12048,6 +12053,7 @@ static void ggml_compute_forward_fused_sparse_ce_f32(
     const ggml_tensor * w       = dst->src[1]; // [n_embd, n_vocab]  any type
     const ggml_tensor * targets = dst->src[2]; // [n_tokens] I32
     const ggml_tensor * weights = dst->src[3]; // [n_tokens] F32
+    const ggml_tensor * bias    = dst->src[4]; // [n_vocab] F32, may be NULL
 
     GGML_ASSERT(ggml_is_scalar(dst) && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(h->type == GGML_TYPE_F32);
@@ -12071,6 +12077,7 @@ static void ggml_compute_forward_fused_sparse_ce_f32(
 
     const int32_t * tgt = (const int32_t *) targets->data;
     const float   * wts = (const float   *) weights->data;
+    const float   * bs  = bias ? (const float *) bias->data : NULL;
 
     // Active tokens: real target and non-zero coefficient. Scanned per thread
     // (cheap over n_tokens) so no cross-thread reduction of the count is needed.
@@ -12101,6 +12108,7 @@ static void ggml_compute_forward_fused_sparse_ce_f32(
             for (int64_t e = 0; e < n_embd; ++e) {
                 z += wv[e]*h_col[e];
             }
+            if (bs) { z += bs[v]; }
             if (z > running_max) {
                 running_sum = running_sum*expf(running_max - z) + 1.0f;
                 running_max = z;
@@ -12152,6 +12160,7 @@ static void ggml_compute_forward_fused_sparse_ce_back_f32(
     const ggml_tensor * w       = dst->src[2]; // [n_embd, n_vocab]  any type
     const ggml_tensor * targets = dst->src[3]; // [n_tokens] I32
     const ggml_tensor * weights = dst->src[4]; // [n_tokens] F32
+    const ggml_tensor * bias    = dst->src[5]; // [n_vocab] F32, may be NULL
 
     GGML_ASSERT(ggml_is_scalar(grad));
     GGML_ASSERT(h->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
@@ -12173,6 +12182,7 @@ static void ggml_compute_forward_fused_sparse_ce_back_f32(
 
     const int32_t * tgt = (const int32_t *) targets->data;
     const float   * wts = (const float   *) weights->data;
+    const float   * bs  = bias ? (const float *) bias->data : NULL;
     const float     g   = ((const float *) grad->data)[0];
 
     int64_t n_active = 0;
@@ -12207,6 +12217,7 @@ static void ggml_compute_forward_fused_sparse_ce_back_f32(
             for (int64_t e = 0; e < n_embd; ++e) {
                 z += wv[e]*h_col[e];
             }
+            if (bs) { z += bs[v]; }
             if (z > running_max) {
                 running_sum = running_sum*expf(running_max - z) + 1.0f;
                 running_max = z;
@@ -12228,6 +12239,7 @@ static void ggml_compute_forward_fused_sparse_ce_back_f32(
             for (int64_t e = 0; e < n_embd; ++e) {
                 z += wv[e]*h_col[e];
             }
+            if (bs) { z += bs[v]; }
             const float p = expf(z - lse);
             for (int64_t e = 0; e < n_embd; ++e) {
                 grad_col[e] += p*wv[e];

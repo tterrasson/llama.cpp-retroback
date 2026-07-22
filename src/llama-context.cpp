@@ -3295,6 +3295,51 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
 // training
 //
 
+// retro delta: unpack the output-head tensor the fused CE optimizer path
+// needs (see docs/memory/03-vocab-logits-chunked-ce.md). Historically this was
+// always a bare MUL_MAT(w, h). Some models (e.g. gemma4 with suppressed
+// tokens, src/models/gemma4.cpp) instead build ADD(MUL_MAT(w, h), bias) with a
+// fixed [n_vocab] F32 bias graph input; recognize that pattern too (either ADD
+// operand order) so the fused path stays available. Returns false only when
+// neither shape matches.
+static bool llama_fused_ce_unpack_head(
+        struct ggml_tensor *   t_logits,
+        struct ggml_tensor * & w,
+        struct ggml_tensor * & h,
+        struct ggml_tensor * & bias) {
+    w = nullptr;
+    h = nullptr;
+    bias = nullptr;
+    if (!t_logits) {
+        return false;
+    }
+    if (t_logits->op == GGML_OP_MUL_MAT) {
+        if (!t_logits->src[0] || !t_logits->src[1]) {
+            return false;
+        }
+        w = t_logits->src[0];
+        h = t_logits->src[1];
+        return true;
+    }
+    if (t_logits->op == GGML_OP_ADD) {
+        for (int i = 0; i < 2; ++i) {
+            struct ggml_tensor * mm   = t_logits->src[i];
+            struct ggml_tensor * side = t_logits->src[1 - i];
+            if (!mm || !side || mm->op != GGML_OP_MUL_MAT || !mm->src[0] || !mm->src[1]) {
+                continue;
+            }
+            if (!ggml_is_vector(side) || side->type != GGML_TYPE_F32 || side->ne[0] != mm->src[0]->ne[1]) {
+                continue;
+            }
+            w    = mm->src[0];
+            h    = mm->src[1];
+            bias = side;
+            return true;
+        }
+    }
+    return false;
+}
+
 static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter param_filter, void * userdata) {
     if (!tensor || tensor->type != GGML_TYPE_F32) {
         return;
@@ -3560,8 +3605,10 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
             // uses. GGML_OPT_LOSS_TYPE_EXTERNAL requires a scalar `outputs`, so the
             // full-vocab logits cannot be handed to the optimizer here.
             struct ggml_tensor * t_logits = res->get_logits();
-            if (!t_logits || t_logits->op != GGML_OP_MUL_MAT ||
-                    !t_logits->src[0] || !t_logits->src[1]) {
+            struct ggml_tensor * ce_w    = nullptr;
+            struct ggml_tensor * ce_h    = nullptr;
+            struct ggml_tensor * ce_bias = nullptr;
+            if (!llama_fused_ce_unpack_head(t_logits, ce_w, ce_h, ce_bias)) {
                 LLAMA_LOG_ERROR("%s: fused CE needs a plain mul_mat output head\n", __func__);
                 ggml_free(ctx_compute_opt);
                 break;
@@ -3571,8 +3618,8 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
             ggml_set_input(ce_targets);
             ggml_set_input(ce_weights);
             struct ggml_tensor * fused_loss = ggml_fused_sparse_ce(
-                    ctx_compute_opt, t_logits->src[1], t_logits->src[0],
-                    ce_targets, ce_weights, opt_ce_tiles);
+                    ctx_compute_opt, ce_h, ce_w,
+                    ce_targets, ce_weights, ce_bias, opt_ce_tiles);
             ggml_set_output(fused_loss);
             struct ggml_cgraph * gf_fused = ggml_new_graph_custom(ctx_compute_opt, size_gf, /*grads =*/ true);
             ggml_build_forward_expand(gf_fused, fused_loss);
@@ -3732,8 +3779,11 @@ void llama_context::opt_epoch_iter(
                 // packed PPO/GRPO path. Rooting the graph at this node removes
                 // the dense vocab logits and labels from every ubatch.
                 struct ggml_tensor * t_logits = res->get_logits();
-                GGML_ASSERT(t_logits && t_logits->op == GGML_OP_MUL_MAT &&
-                        t_logits->src[0] && t_logits->src[1]);
+                struct ggml_tensor * ce_w    = nullptr;
+                struct ggml_tensor * ce_h    = nullptr;
+                struct ggml_tensor * ce_bias = nullptr;
+                GGML_ASSERT(llama_fused_ce_unpack_head(t_logits, ce_w, ce_h, ce_bias) &&
+                        "fused CE needs a plain mul_mat output head");
                 ce_targets = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_I32, n_outputs);
                 ce_weights = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_F32, n_outputs);
                 ggml_set_input(ce_targets);
@@ -3741,8 +3791,8 @@ void llama_context::opt_epoch_iter(
                 ggml_set_name(ce_targets, "ce_targets");
                 ggml_set_name(ce_weights, "ce_weights");
                 struct ggml_tensor * fused_loss = ggml_fused_sparse_ce(
-                        ctx_compute_opt, t_logits->src[1], t_logits->src[0],
-                        ce_targets, ce_weights, opt_ce_tiles);
+                        ctx_compute_opt, ce_h, ce_w,
+                        ce_targets, ce_weights, ce_bias, opt_ce_tiles);
                 ggml_set_output(fused_loss);
                 struct ggml_cgraph * gf_fused = ggml_new_graph_custom(
                         ctx_compute_opt, ggml_graph_size(gf), /*grads =*/ true);
@@ -3973,13 +4023,13 @@ bool llama_context::opt_step_packed_sequences(
                 // root a fresh forward graph at the fused scalar loss. Those logits
                 // are not an ancestor of the loss, so they are never allocated.
                 struct ggml_tensor * t_logits = res->get_logits();
-                if (!t_logits || t_logits->op != GGML_OP_MUL_MAT ||
-                        !t_logits->src[0] || !t_logits->src[1]) {
+                struct ggml_tensor * proj_w = nullptr; // [n_embd, n_vocab]
+                struct ggml_tensor * hidden = nullptr; // [n_embd, n_tokens]
+                struct ggml_tensor * ce_bias = nullptr; // [n_vocab] F32, or null
+                if (!llama_fused_ce_unpack_head(t_logits, proj_w, hidden, ce_bias)) {
                     LLAMA_LOG_ERROR("%s: fused CE needs a plain mul_mat output head\n", __func__);
                     break;
                 }
-                struct ggml_tensor * proj_w = t_logits->src[0]; // [n_embd, n_vocab]
-                struct ggml_tensor * hidden = t_logits->src[1]; // [n_embd, n_tokens]
                 if (hidden->ne[1] != (int64_t) n_tokens) {
                     LLAMA_LOG_ERROR("%s: fused CE hidden width %lld != %u\n",
                             __func__, (long long) hidden->ne[1], n_tokens);
@@ -3995,7 +4045,7 @@ bool llama_context::opt_step_packed_sequences(
                 ggml_set_name(ce_weights, "ce_weights");
                 struct ggml_tensor * fused_loss = ggml_fused_sparse_ce(
                         opt_cached_compute_ctx.get(), hidden, proj_w,
-                        ce_targets, ce_weights, opt_ce_tiles);
+                        ce_targets, ce_weights, ce_bias, opt_ce_tiles);
                 ggml_set_output(fused_loss);
                 struct ggml_cgraph * gf_fused = ggml_new_graph_custom(
                         opt_cached_compute_ctx.get(), size_gf, /*grads =*/ true);
