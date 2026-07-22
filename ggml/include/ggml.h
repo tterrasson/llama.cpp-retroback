@@ -2774,14 +2774,18 @@ extern "C" {
             struct ggml_tensor  * c); // gradients of cross_entropy_loss result
 
     // retro delta: fused sparse cross-entropy over a projection head.
-    // Equivalent to cross_entropy_loss(mul_mat(w, h), labels) where labels is the
-    // sparse weighted one-hot [weights[t] at targets[t]], but streams the vocab in
-    // `n_tiles` tiles so the full [n_vocab, n_tokens] logits are never
-    // materialized. The projection head `w` is treated as frozen (no gradient).
+    // Equivalent to cross_entropy_loss(mul_mat(w, h) [+ bias], labels) where
+    // labels is the sparse weighted one-hot [weights[t] at targets[t]], but
+    // streams the vocab in `n_tiles` tiles so the full [n_vocab, n_tokens] logits
+    // are never materialized. The projection head `w` is treated as frozen (no
+    // gradient); `bias`, when given, is a fixed (non-trainable) per-vocab additive
+    // term — e.g. gemma4's logits-bias for suppressed tokens — and likewise never
+    // receives a gradient.
     //   h       : [n_embd, n_tokens]  F32 hidden states
     //   w       : [n_embd, n_vocab]   projection head (any type, incl. quantized)
     //   targets : [n_tokens]          I32 target vocab id, < 0 marks a masked token
     //   weights : [n_tokens]          F32 per-token coefficient (may be negative)
+    //   bias    : [n_vocab] F32, or NULL for no bias
     // Result is the scalar loss, already averaged over the active tokens.
     GGML_API struct ggml_tensor * ggml_fused_sparse_ce(
             struct ggml_context * ctx,
@@ -2789,11 +2793,12 @@ extern "C" {
             struct ggml_tensor  * w,
             struct ggml_tensor  * targets,
             struct ggml_tensor  * weights,
+            struct ggml_tensor  * bias, // may be NULL
             int                   n_tiles);
 
     // Gradient of ggml_fused_sparse_ce wrt the hidden states `h`.
     //   a       : scalar gradient of the loss result
-    //   h, w, targets, weights : the forward inputs
+    //   h, w, targets, weights, bias : the forward inputs (bias may be NULL)
     // Result has the shape of `h`.
     GGML_API struct ggml_tensor * ggml_fused_sparse_ce_back(
             struct ggml_context * ctx,
@@ -2802,6 +2807,7 @@ extern "C" {
             struct ggml_tensor  * w,
             struct ggml_tensor  * targets,
             struct ggml_tensor  * weights,
+            struct ggml_tensor  * bias, // may be NULL
             int                   n_tiles);
 
     // AdamW optimizer step

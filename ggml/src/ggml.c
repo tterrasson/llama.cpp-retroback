@@ -6254,6 +6254,7 @@ struct ggml_tensor * ggml_fused_sparse_ce(
         struct ggml_tensor  * w,
         struct ggml_tensor  * targets,
         struct ggml_tensor  * weights,
+        struct ggml_tensor  * bias,
         int                   n_tiles) {
     GGML_ASSERT(h->type == GGML_TYPE_F32);
     GGML_ASSERT(targets->type == GGML_TYPE_I32);
@@ -6262,6 +6263,9 @@ struct ggml_tensor * ggml_fused_sparse_ce(
     GGML_ASSERT(w->ne[0] == h->ne[0]);           // shared embedding dim
     GGML_ASSERT(targets->ne[0] == h->ne[1]);     // one target per token
     GGML_ASSERT(weights->ne[0] == h->ne[1]);     // one weight per token
+    // retro delta: optional fixed (non-trainable) per-vocab additive bias, e.g.
+    // gemma4's logits-bias for suppressed tokens (see llm_graph_input_logits_bias).
+    GGML_ASSERT(bias == NULL || (ggml_is_vector(bias) && bias->ne[0] == w->ne[1] && bias->type == GGML_TYPE_F32));
     GGML_ASSERT(n_tiles >= 1);
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
@@ -6273,6 +6277,7 @@ struct ggml_tensor * ggml_fused_sparse_ce(
     result->src[1] = w;
     result->src[2] = targets;
     result->src[3] = weights;
+    result->src[4] = bias;
 
     return result;
 }
@@ -6286,11 +6291,13 @@ struct ggml_tensor * ggml_fused_sparse_ce_back(
         struct ggml_tensor  * w,
         struct ggml_tensor  * targets,
         struct ggml_tensor  * weights,
+        struct ggml_tensor  * bias,
         int                   n_tiles) {
     GGML_ASSERT(ggml_is_scalar(a));
     GGML_ASSERT(h->type == GGML_TYPE_F32);
     GGML_ASSERT(targets->type == GGML_TYPE_I32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias == NULL || (ggml_is_vector(bias) && bias->ne[0] == w->ne[1] && bias->type == GGML_TYPE_F32));
     GGML_ASSERT(n_tiles >= 1);
 
     struct ggml_tensor * result = ggml_dup_tensor(ctx, h);
@@ -6303,6 +6310,7 @@ struct ggml_tensor * ggml_fused_sparse_ce_back(
     result->src[2] = w;
     result->src[3] = targets;
     result->src[4] = weights;
+    result->src[5] = bias;
 
     return result;
 }
@@ -7388,7 +7396,7 @@ static void ggml_compute_backward(
                 const int32_t n_tiles = ggml_get_op_params_i32(tensor, 0);
                 ggml_add_or_set(ctx, cgraph, isrc0,
                         ggml_fused_sparse_ce_back(ctx, grad, src0, tensor->src[1],
-                                tensor->src[2], tensor->src[3], n_tiles));
+                                tensor->src[2], tensor->src[3], tensor->src[4], n_tiles));
             }
             GGML_ASSERT(!src1_needs_grads && "fused CE: gradient for the projection head not implemented");
             GGML_ASSERT(!src2_needs_grads && "fused CE: gradient for targets not defined");
