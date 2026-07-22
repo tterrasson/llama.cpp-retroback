@@ -6726,7 +6726,14 @@ static void ggml_acc_or_set(
     if (cgraph->grads[isrc]) {
         cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
     } else {
-        struct ggml_tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
+        // Gradients are accumulated in F32 even when the viewed activation is
+        // stored in F16 (notably the differentiable training KV cache).
+        // ggml_acc only accepts F32 operands, so promote the zero initializer
+        // instead of inheriting the activation's storage type.
+        struct ggml_tensor * a_zero = src->type == GGML_TYPE_F32
+                ? ggml_scale(ctx, src, 0.0f)
+                : ggml_fill(ctx,
+                        ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, src->ne), 0.0f);
         cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
@@ -7038,9 +7045,12 @@ static void ggml_compute_backward(
                 size_t nb2 = tensor->nb[2];
                 size_t nb3 = tensor->nb[3];
 
-                if (cgraph->grads[isrc0] && src0->type != cgraph->grads[isrc0]->type) {
+                const struct ggml_tensor * grad_layout = cgraph->grads[isrc0]
+                        ? cgraph->grads[isrc0]
+                        : grad;
+                if (src0->type != grad_layout->type) {
                     // gradient is typically F32, but src0 could be other type
-                    size_t ng = ggml_element_size(cgraph->grads[isrc0]);
+                    size_t ng = ggml_element_size(grad_layout);
                     size_t n0 = ggml_element_size(src0);
                     GGML_ASSERT(offset % n0 == 0);
                     GGML_ASSERT(nb1 % n0 == 0);
