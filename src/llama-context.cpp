@@ -3447,6 +3447,40 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     // scalar loss node, so the optimizer uses GGML_OPT_LOSS_TYPE_EXTERNAL and
     // never builds the dense [n_vocab, n_tokens] labels tensor.
     opt_fused_ce = lopt_params.fused_sparse_ce;
+
+    // retro delta (plan 03): the fused sparse CE computes the loss straight from
+    // z[v,t] = dot(w[:,v], h[:,t]) (+bias) and never applies a final-logit
+    // softcap. The gemma2/3/3n/4 and grok graphs insert a tanh cap between the
+    // mul_mat and the loss, so the head is neither a plain mul_mat nor
+    // mul_mat+bias and the fused math would be wrong even if the head could be
+    // unpacked. Fall back to the dense (correct) path with a clear message
+    // instead of failing later at graph-build time with the opaque
+    // "fused CE needs a plain mul_mat output head".
+    //
+    // Gate on the architecture, not on f_final_logit_softcapping alone: only
+    // these archs consume the field in their graph. Other architectures never
+    // read the GGUF key and so keep the struct default (30.0f), which does NOT
+    // mean they softcap -- testing the float alone would wrongly disable the
+    // fused path for Qwen2/Phi/etc., the very models the bias support targets.
+    // (gemma4-assistant builds a plain mul_mat head and is intentionally absent.)
+    const bool arch_softcaps_final =
+            model->arch == LLM_ARCH_GEMMA2  ||
+            model->arch == LLM_ARCH_GEMMA3  ||
+            model->arch == LLM_ARCH_GEMMA3N ||
+            model->arch == LLM_ARCH_GEMMA4  ||
+            model->arch == LLM_ARCH_GROK;
+    if (opt_fused_ce && arch_softcaps_final &&
+            model->hparams.f_final_logit_softcapping != 0.0f) {
+        // ERROR level on purpose: this silently overrides an explicitly
+        // requested config option (chunked/fused CE), and the retroback runtime
+        // log filter only forwards ERROR when verbose=false.
+        LLAMA_LOG_ERROR("%s: chunked/fused cross-entropy is incompatible with "
+                "final-logit softcapping (f_final_logit_softcapping=%.1f); the "
+                "fused loss does not model the tanh cap. Falling back to the "
+                "dense cross-entropy path for this model.\n",
+                __func__, (double) model->hparams.f_final_logit_softcapping);
+        opt_fused_ce = false;
+    }
     opt_ce_tiles = lopt_params.n_ce_tiles > 0 ? lopt_params.n_ce_tiles : 1;
     opt_gradient_checkpointing = lopt_params.gradient_checkpointing;
     opt_checkpoint_every_n_layers = lopt_params.checkpoint_every_n_layers > 0
