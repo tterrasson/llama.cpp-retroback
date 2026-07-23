@@ -6255,7 +6255,8 @@ struct ggml_tensor * ggml_fused_sparse_ce(
         struct ggml_tensor  * targets,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * bias,
-        int                   n_tiles) {
+        int                   n_tiles,
+        int                   seq_chunk) {
     GGML_ASSERT(h->type == GGML_TYPE_F32);
     GGML_ASSERT(targets->type == GGML_TYPE_I32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
@@ -6267,10 +6268,12 @@ struct ggml_tensor * ggml_fused_sparse_ce(
     // gemma4's logits-bias for suppressed tokens (see llm_graph_input_logits_bias).
     GGML_ASSERT(bias == NULL || (ggml_is_vector(bias) && bias->ne[0] == w->ne[1] && bias->type == GGML_TYPE_F32));
     GGML_ASSERT(n_tiles >= 1);
+    GGML_ASSERT(seq_chunk >= 0);
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
 
     ggml_set_op_params_i32(result, 0, n_tiles);
+    ggml_set_op_params_i32(result, 1, seq_chunk);
 
     result->op     = GGML_OP_FUSED_SPARSE_CE;
     result->src[0] = h;
@@ -6292,17 +6295,20 @@ struct ggml_tensor * ggml_fused_sparse_ce_back(
         struct ggml_tensor  * targets,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * bias,
-        int                   n_tiles) {
+        int                   n_tiles,
+        int                   seq_chunk) {
     GGML_ASSERT(ggml_is_scalar(a));
     GGML_ASSERT(h->type == GGML_TYPE_F32);
     GGML_ASSERT(targets->type == GGML_TYPE_I32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(bias == NULL || (ggml_is_vector(bias) && bias->ne[0] == w->ne[1] && bias->type == GGML_TYPE_F32));
     GGML_ASSERT(n_tiles >= 1);
+    GGML_ASSERT(seq_chunk >= 0);
 
     struct ggml_tensor * result = ggml_dup_tensor(ctx, h);
 
     ggml_set_op_params_i32(result, 0, n_tiles);
+    ggml_set_op_params_i32(result, 1, seq_chunk);
 
     result->op     = GGML_OP_FUSED_SPARSE_CE_BACK;
     result->src[0] = a;
@@ -7393,10 +7399,11 @@ static void ggml_compute_backward(
             // Only the hidden states (src0) receive a gradient; the projection
             // head (src1) is frozen and the target/weight inputs are constants.
             if (src0_needs_grads) {
-                const int32_t n_tiles = ggml_get_op_params_i32(tensor, 0);
+                const int32_t n_tiles   = ggml_get_op_params_i32(tensor, 0);
+                const int32_t seq_chunk = ggml_get_op_params_i32(tensor, 1);
                 ggml_add_or_set(ctx, cgraph, isrc0,
                         ggml_fused_sparse_ce_back(ctx, grad, src0, tensor->src[1],
-                                tensor->src[2], tensor->src[3], tensor->src[4], n_tiles));
+                                tensor->src[2], tensor->src[3], tensor->src[4], n_tiles, seq_chunk));
             }
             GGML_ASSERT(!src1_needs_grads && "fused CE: gradient for the projection head not implemented");
             GGML_ASSERT(!src2_needs_grads && "fused CE: gradient for targets not defined");

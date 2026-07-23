@@ -1598,6 +1598,11 @@ extern "C" {
         // never materialized. n_ce_tiles is the vocabulary tile count C (>= 1).
         bool    fused_sparse_ce;
         int32_t n_ce_tiles;
+        // retro delta (plan rl/OPTIMIZE feature 1): flattened (batch x seq) token
+        // chunk size for the fused CE. 0 processes all tokens at once (unchanged);
+        // > 0 bounds the tiled logits intermediate to n_ce_seq_chunk tokens,
+        // capping peak footprint independently of the sequence length.
+        int32_t n_ce_seq_chunk;
 
         // retro delta (plan 02): recompute transformer activations during the
         // backward pass, retaining every Nth layer output as a checkpoint.

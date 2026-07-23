@@ -12032,6 +12032,13 @@ void ggml_compute_forward_cross_entropy_loss_back(
 // backward, may be NULL) is added to every z[v,t] before the log-sum-exp and
 // target-logit terms, matching ADD(MUL_MAT(w,h), bias) output heads (e.g.
 // gemma4's suppressed-token logits bias). The bias never receives a gradient.
+//
+// retro delta (plan rl/OPTIMIZE feature 1): op_params[0] (vocab tile count) and
+// op_params[1] (seq_chunk, the flattened-token chunk size) are honored only by
+// the CUDA kernel, where they bound the materialized logits intermediate. The
+// CPU reference already streams one token and one vocab row at a time with only
+// O(n_embd) scratch, so it is exact and invariant to both parameters and reads
+// neither. See docs/rl/OPTIMIZE.md.
 
 static inline void ggml_fused_ce_row_to_f32(
         const ggml_tensor * w, int64_t v, ggml_to_float_t to_float,

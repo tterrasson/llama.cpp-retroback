@@ -3482,6 +3482,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         opt_fused_ce = false;
     }
     opt_ce_tiles = lopt_params.n_ce_tiles > 0 ? lopt_params.n_ce_tiles : 1;
+    opt_ce_seq_chunk = lopt_params.n_ce_seq_chunk > 0 ? lopt_params.n_ce_seq_chunk : 0;
     opt_gradient_checkpointing = lopt_params.gradient_checkpointing;
     opt_checkpoint_every_n_layers = lopt_params.checkpoint_every_n_layers > 0
             ? lopt_params.checkpoint_every_n_layers : 1;
@@ -3655,7 +3656,7 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
             ggml_set_input(ce_weights);
             struct ggml_tensor * fused_loss = ggml_fused_sparse_ce(
                     ctx_compute_opt, ce_h, ce_w,
-                    ce_targets, ce_weights, ce_bias, opt_ce_tiles);
+                    ce_targets, ce_weights, ce_bias, opt_ce_tiles, opt_ce_seq_chunk);
             ggml_set_output(fused_loss);
             struct ggml_cgraph * gf_fused = ggml_new_graph_custom(ctx_compute_opt, size_gf, /*grads =*/ true);
             ggml_build_forward_expand(gf_fused, fused_loss);
@@ -3828,7 +3829,7 @@ void llama_context::opt_epoch_iter(
                 ggml_set_name(ce_weights, "ce_weights");
                 struct ggml_tensor * fused_loss = ggml_fused_sparse_ce(
                         ctx_compute_opt, ce_h, ce_w,
-                        ce_targets, ce_weights, ce_bias, opt_ce_tiles);
+                        ce_targets, ce_weights, ce_bias, opt_ce_tiles, opt_ce_seq_chunk);
                 ggml_set_output(fused_loss);
                 struct ggml_cgraph * gf_fused = ggml_new_graph_custom(
                         ctx_compute_opt, ggml_graph_size(gf), /*grads =*/ true);
@@ -4081,7 +4082,7 @@ bool llama_context::opt_step_packed_sequences(
                 ggml_set_name(ce_weights, "ce_weights");
                 struct ggml_tensor * fused_loss = ggml_fused_sparse_ce(
                         opt_cached_compute_ctx.get(), hidden, proj_w,
-                        ce_targets, ce_weights, ce_bias, opt_ce_tiles);
+                        ce_targets, ce_weights, ce_bias, opt_ce_tiles, opt_ce_seq_chunk);
                 ggml_set_output(fused_loss);
                 struct ggml_cgraph * gf_fused = ggml_new_graph_custom(
                         opt_cached_compute_ctx.get(), size_gf, /*grads =*/ true);
