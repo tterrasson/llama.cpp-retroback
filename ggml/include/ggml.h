@@ -2792,6 +2792,14 @@ extern "C" {
     // logits intermediate to [n_vocab/n_tiles, seq_chunk] instead of
     // [n_vocab/n_tiles, n_tokens]. 0 means "all tokens at once" (unchanged). The
     // result is invariant to seq_chunk; only the peak footprint changes.
+    // retro delta (plan rl/OPTIMIZE feature 3): offload_h authorizes the backward
+    // to run in place over `h` — the graph allocator may then hand grad_h the very
+    // buffer holding the hidden states, so the [n_embd, n_tokens] activations and
+    // their gradient never coexist on the device. The backward evicts one token
+    // chunk of `h` into a [n_embd, seq_chunk] staging buffer before overwriting it,
+    // which only bounds the peak when seq_chunk > 0 (with seq_chunk = 0 the staging
+    // buffer is the full tensor and nothing is saved). Numerically inert: the
+    // result is identical with and without the flag.
     GGML_API struct ggml_tensor * ggml_fused_sparse_ce(
             struct ggml_context * ctx,
             struct ggml_tensor  * h,
@@ -2800,12 +2808,15 @@ extern "C" {
             struct ggml_tensor  * weights,
             struct ggml_tensor  * bias, // may be NULL
             int                   n_tiles,
-            int                   seq_chunk);
+            int                   seq_chunk,
+            int                   offload_h);
 
     // Gradient of ggml_fused_sparse_ce wrt the hidden states `h`.
     //   a       : scalar gradient of the loss result
     //   h, w, targets, weights, bias : the forward inputs (bias may be NULL)
-    // Result has the shape of `h`. seq_chunk has the same meaning as above.
+    // Result has the shape of `h`. seq_chunk / offload_h have the same meaning as
+    // above; offload_h is what makes this node eligible for in-place allocation
+    // over `h`.
     GGML_API struct ggml_tensor * ggml_fused_sparse_ce_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2815,7 +2826,8 @@ extern "C" {
             struct ggml_tensor  * weights,
             struct ggml_tensor  * bias, // may be NULL
             int                   n_tiles,
-            int                   seq_chunk);
+            int                   seq_chunk,
+            int                   offload_h);
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf

@@ -6256,7 +6256,8 @@ struct ggml_tensor * ggml_fused_sparse_ce(
         struct ggml_tensor  * weights,
         struct ggml_tensor  * bias,
         int                   n_tiles,
-        int                   seq_chunk) {
+        int                   seq_chunk,
+        int                   offload_h) {
     GGML_ASSERT(h->type == GGML_TYPE_F32);
     GGML_ASSERT(targets->type == GGML_TYPE_I32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
@@ -6274,6 +6275,7 @@ struct ggml_tensor * ggml_fused_sparse_ce(
 
     ggml_set_op_params_i32(result, 0, n_tiles);
     ggml_set_op_params_i32(result, 1, seq_chunk);
+    ggml_set_op_params_i32(result, 2, offload_h != 0);
 
     result->op     = GGML_OP_FUSED_SPARSE_CE;
     result->src[0] = h;
@@ -6296,7 +6298,8 @@ struct ggml_tensor * ggml_fused_sparse_ce_back(
         struct ggml_tensor  * weights,
         struct ggml_tensor  * bias,
         int                   n_tiles,
-        int                   seq_chunk) {
+        int                   seq_chunk,
+        int                   offload_h) {
     GGML_ASSERT(ggml_is_scalar(a));
     GGML_ASSERT(h->type == GGML_TYPE_F32);
     GGML_ASSERT(targets->type == GGML_TYPE_I32);
@@ -6309,6 +6312,7 @@ struct ggml_tensor * ggml_fused_sparse_ce_back(
 
     ggml_set_op_params_i32(result, 0, n_tiles);
     ggml_set_op_params_i32(result, 1, seq_chunk);
+    ggml_set_op_params_i32(result, 2, offload_h != 0);
 
     result->op     = GGML_OP_FUSED_SPARSE_CE_BACK;
     result->src[0] = a;
@@ -7401,9 +7405,11 @@ static void ggml_compute_backward(
             if (src0_needs_grads) {
                 const int32_t n_tiles   = ggml_get_op_params_i32(tensor, 0);
                 const int32_t seq_chunk = ggml_get_op_params_i32(tensor, 1);
+                const int32_t offload_h = ggml_get_op_params_i32(tensor, 2);
                 ggml_add_or_set(ctx, cgraph, isrc0,
                         ggml_fused_sparse_ce_back(ctx, grad, src0, tensor->src[1],
-                                tensor->src[2], tensor->src[3], tensor->src[4], n_tiles, seq_chunk));
+                                tensor->src[2], tensor->src[3], tensor->src[4], n_tiles, seq_chunk,
+                                offload_h));
             }
             GGML_ASSERT(!src1_needs_grads && "fused CE: gradient for the projection head not implemented");
             GGML_ASSERT(!src2_needs_grads && "fused CE: gradient for targets not defined");
