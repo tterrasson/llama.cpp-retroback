@@ -509,6 +509,9 @@ extern "C" {
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
         GGML_OP_L2_NORM,
+        // retro delta: analytic backward for GGML_OP_L2_NORM (needed by Qwen3.5's
+        // gated delta net k/q per-token L2 normalization). See ggml_l2_norm_back.
+        GGML_OP_L2_NORM_BACK,
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
@@ -1428,6 +1431,15 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_l2_norm_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
+            float                 eps);
+
+    // retro delta: analytic backward for ggml_l2_norm.
+    // a - grad of the l2_norm output
+    // b - x (the l2_norm input from the forward pass)
+    GGML_API struct ggml_tensor * ggml_l2_norm_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
             float                 eps);
 
     // a - x
