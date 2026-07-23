@@ -593,6 +593,12 @@ extern "C" {
         GGML_OP_SSM_CONV_BACK,
         GGML_OP_SSM_SCAN_BACK,
 
+        // retro delta: analytic backward for GGML_OP_GATED_DELTA_NET (Qwen3-Next /
+        // Qwen3.5). Recomputes the per-token recurrence forward (storing the
+        // trajectory of states) then reverse-scans it, mirroring
+        // GGML_OP_SSM_SCAN_BACK's structure. See ggml_gated_delta_net_back.
+        GGML_OP_GATED_DELTA_NET_BACK,
+
         // retro delta: fused sparse cross-entropy over a projection head. Computes
         // the weighted cross-entropy loss (and its gradient wrt the hidden states)
         // by streaming the vocabulary in tiles, so the full [n_vocab, n_tokens]
@@ -2620,6 +2626,21 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
+            int64_t               K);
+
+    // retro delta: analytic backward for ggml_gated_delta_net. `grad` is the
+    // gradient of the full packed forward output (attn scores ++ K state
+    // snapshots). Returns a packed tensor [ grad_q | grad_k | grad_v | grad_g |
+    // grad_beta | grad_state ] (flat, in that order); slice with ggml_view_1d.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * grad,
             int64_t               K);
 
     // DSA lightning indexer
