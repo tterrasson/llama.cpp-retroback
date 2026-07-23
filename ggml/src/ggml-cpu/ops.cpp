@@ -12184,8 +12184,14 @@ static void ggml_compute_forward_fused_sparse_ce_back_f32(
     ggml_to_float_t const to_float = ggml_get_type_traits(w->type)->to_float;
     GGML_ASSERT(w->type == GGML_TYPE_F32 || to_float);
 
-    GGML_ASSERT(params->wsize >= sizeof(float) * (size_t)(nth*n_embd));
-    float * deq = (float *) params->wdata + ith*n_embd; // per-thread [n_embd]
+    // retro delta (plan rl/OPTIMIZE feature 3): with offload_h the allocator may
+    // hand `dst` the very buffer of `h`, so grad_col and h_col alias. Copy the
+    // column out before the first write; done unconditionally (O(n_embd) next to
+    // the O(n_vocab*n_embd) body) so there is a single arithmetic path and the
+    // CPU stays a bit-identical oracle whether or not the flag is set.
+    GGML_ASSERT(params->wsize >= sizeof(float) * (size_t)(2*nth*n_embd));
+    float * deq   = (float *) params->wdata + ith*n_embd;             // per-thread [n_embd]
+    float * h_loc = (float *) params->wdata + (nth + ith)*n_embd;     // per-thread [n_embd]
 
     const int32_t * tgt = (const int32_t *) targets->data;
     const float   * wts = (const float   *) weights->data;
@@ -12212,7 +12218,8 @@ static void ggml_compute_forward_fused_sparse_ce_back_f32(
             }
             continue;
         }
-        const float * h_col = (const float *)((const char *) h->data + t*h->nb[1]);
+        memcpy(h_loc, (const char *) h->data + t*h->nb[1], n_embd*sizeof(float));
+        const float * h_col = h_loc;
 
         // Pass 1: online log-sum-exp, identical to the forward.
         float running_max = -INFINITY;

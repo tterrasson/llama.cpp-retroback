@@ -394,6 +394,8 @@ private:
     bool    opt_fused_ce = false;
     int32_t opt_ce_tiles = 1;
     int32_t opt_ce_seq_chunk = 0;
+    // Resolved (not requested): already forced off when opt_ce_seq_chunk == 0.
+    bool    opt_ce_offload_logsoftmax = false;
     bool    opt_gradient_checkpointing = false;
     uint32_t opt_checkpoint_every_n_layers = 1;
 

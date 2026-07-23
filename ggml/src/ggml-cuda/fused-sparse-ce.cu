@@ -269,12 +269,26 @@ void ggml_cuda_fused_sparse_ce_back(ggml_backend_cuda_context & ctx, ggml_tensor
     const int64_t chunk = fused_sparse_ce_seq_chunk(dst, n_tokens);
     ggml_cuda_pool_alloc<float> logits(pool, tile*chunk);
 
+    // retro delta (plan rl/OPTIMIZE feature 3): with offload_h the graph allocator
+    // gives grad_h the buffer of `h`, so writing a column would destroy the hidden
+    // state the very next vocab tile still has to read. Accumulate the chunk into a
+    // [n_embd, chunk] staging buffer instead and copy it back once the chunk is
+    // done; chunks own disjoint columns, so the eviction is exact. The staging
+    // buffer only bounds the peak when seq_chunk > 0 -- that is why the flag is
+    // gated on it upstream.
+    const bool inplace = dst->data == h->data;
+    ggml_cuda_pool_alloc<float> grad_stage(pool);
+    if (inplace) {
+        grad_stage.alloc(n_embd*chunk);
+    }
+
     cublasHandle_t handle = ctx.cublas_handle();
     CUBLAS_CHECK(cublasSetStream(handle, stream));
     const float alpha = 1.0f, beta0 = 0.0f, beta1 = 1.0f;
     const int threads = 256;
     for (int64_t t0 = 0; t0 < n_tokens; t0 += chunk) {
         const int64_t nt = std::min(chunk, n_tokens - t0);
+        float * out = inplace ? grad_stage.get() : (float *) dst->data + t0*n_embd;
         // Recompute this chunk's online log-sum-exp (checkpointing over the
         // sequence axis), then accumulate grad_h tile by tile.
         fused_sparse_ce_lse(ctx, (const float *) h->data, w_f32, targets, bias_f32,
@@ -300,8 +314,12 @@ void ggml_cuda_fused_sparse_ce_back(ggml_backend_cuda_context & ctx, ggml_tensor
             const float * beta = first ? &beta0 : &beta1;
             CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                 n_embd, nt, nv, &alpha, w_f32 + v0*n_embd, n_embd,
-                logits.get(), tile, beta, (float *) dst->data + t0*n_embd, n_embd));
+                logits.get(), tile, beta, out, n_embd));
             first = false;
+        }
+        if (inplace) {
+            CUDA_CHECK(cudaMemcpyAsync((float *) dst->data + t0*n_embd, out,
+                n_embd*nt*sizeof(float), cudaMemcpyDeviceToDevice, stream));
         }
     }
     const int64_t n_out = n_embd*n_tokens;

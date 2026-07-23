@@ -3340,6 +3340,22 @@ static bool llama_fused_ce_unpack_head(
     return false;
 }
 
+// retro delta (plan rl/OPTIMIZE feature 3): the hidden states the fused CE reads
+// are the model's embeddings output (`result_norm`), which llm_graph_result marks
+// GGML_TENSOR_FLAG_OUTPUT. ggml-alloc never frees an output and never lets another
+// node reuse its buffer, so the flag pins the full [n_embd, n_tokens] activations
+// for the whole graph *and* blocks the in-place grad_h this feature is about.
+// Nothing reads embeddings back out of the optimizer graph — the step consumes the
+// fused scalar loss — and the training result object is rebuilt per step, distinct
+// from the decode/scoring graphs (which is where the PPO critic gets its hidden
+// states). Dropping the flag here is therefore confined to the training graph, and
+// only happens when the offload was explicitly requested.
+static void llama_fused_ce_release_hidden_output(struct ggml_tensor * h) {
+    if (h) {
+        h->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+    }
+}
+
 static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter param_filter, void * userdata) {
     if (!tensor || tensor->type != GGML_TYPE_F32) {
         return;
@@ -3481,6 +3497,16 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     }
     opt_ce_tiles = lopt_params.n_ce_tiles > 0 ? lopt_params.n_ce_tiles : 1;
     opt_ce_seq_chunk = lopt_params.n_ce_seq_chunk > 0 ? lopt_params.n_ce_seq_chunk : 0;
+    // retro delta (plan rl/OPTIMIZE feature 3): offloading the log-softmax
+    // activations means letting grad_h reuse the buffer of `h`, one evicted token
+    // chunk at a time. Without token chunking the "chunk" is the whole tensor and
+    // the staging buffer costs exactly what the aliasing saves, so the flag buys
+    // nothing -- say so loudly rather than pretending it is on.
+    opt_ce_offload_logsoftmax = lopt_params.ce_offload_logsoftmax && opt_ce_seq_chunk > 0;
+    if (lopt_params.ce_offload_logsoftmax && opt_ce_seq_chunk == 0) {
+        LLAMA_LOG_WARN("%s: log-softmax activation offloading requires token chunking "
+                "(n_ce_seq_chunk > 0); ignoring it for this run\n", __func__);
+    }
     opt_gradient_checkpointing = lopt_params.gradient_checkpointing;
     opt_checkpoint_every_n_layers = lopt_params.checkpoint_every_n_layers > 0
             ? lopt_params.checkpoint_every_n_layers : 1;
@@ -3648,13 +3674,17 @@ int32_t llama_context::opt_preflight(llama_opt_preflight_cb callback, void * use
                 ggml_free(ctx_compute_opt);
                 break;
             }
+            if (opt_ce_offload_logsoftmax) {
+                llama_fused_ce_release_hidden_output(ce_h);
+            }
             struct ggml_tensor * ce_targets = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_I32, n_outputs);
             struct ggml_tensor * ce_weights = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_F32, n_outputs);
             ggml_set_input(ce_targets);
             ggml_set_input(ce_weights);
             struct ggml_tensor * fused_loss = ggml_fused_sparse_ce(
                     ctx_compute_opt, ce_h, ce_w,
-                    ce_targets, ce_weights, ce_bias, opt_ce_tiles, opt_ce_seq_chunk);
+                    ce_targets, ce_weights, ce_bias, opt_ce_tiles, opt_ce_seq_chunk,
+                    opt_ce_offload_logsoftmax);
             ggml_set_output(fused_loss);
             struct ggml_cgraph * gf_fused = ggml_new_graph_custom(ctx_compute_opt, size_gf, /*grads =*/ true);
             ggml_build_forward_expand(gf_fused, fused_loss);
@@ -3819,6 +3849,9 @@ void llama_context::opt_epoch_iter(
                 struct ggml_tensor * ce_bias = nullptr;
                 GGML_ASSERT(llama_fused_ce_unpack_head(t_logits, ce_w, ce_h, ce_bias) &&
                         "fused CE needs a plain mul_mat output head");
+                if (opt_ce_offload_logsoftmax) {
+                    llama_fused_ce_release_hidden_output(ce_h);
+                }
                 ce_targets = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_I32, n_outputs);
                 ce_weights = ggml_new_tensor_1d(ctx_compute_opt, GGML_TYPE_F32, n_outputs);
                 ggml_set_input(ce_targets);
@@ -3827,7 +3860,8 @@ void llama_context::opt_epoch_iter(
                 ggml_set_name(ce_weights, "ce_weights");
                 struct ggml_tensor * fused_loss = ggml_fused_sparse_ce(
                         ctx_compute_opt, ce_h, ce_w,
-                        ce_targets, ce_weights, ce_bias, opt_ce_tiles, opt_ce_seq_chunk);
+                        ce_targets, ce_weights, ce_bias, opt_ce_tiles, opt_ce_seq_chunk,
+                        opt_ce_offload_logsoftmax);
                 ggml_set_output(fused_loss);
                 struct ggml_cgraph * gf_fused = ggml_new_graph_custom(
                         ctx_compute_opt, ggml_graph_size(gf), /*grads =*/ true);
@@ -4070,6 +4104,9 @@ bool llama_context::opt_step_packed_sequences(
                             __func__, (long long) hidden->ne[1], n_tokens);
                     break;
                 }
+                if (opt_ce_offload_logsoftmax) {
+                    llama_fused_ce_release_hidden_output(hidden);
+                }
                 ce_targets = ggml_new_tensor_1d(opt_cached_compute_ctx.get(),
                         GGML_TYPE_I32, n_tokens);
                 ce_weights = ggml_new_tensor_1d(opt_cached_compute_ctx.get(),
@@ -4080,7 +4117,8 @@ bool llama_context::opt_step_packed_sequences(
                 ggml_set_name(ce_weights, "ce_weights");
                 struct ggml_tensor * fused_loss = ggml_fused_sparse_ce(
                         opt_cached_compute_ctx.get(), hidden, proj_w,
-                        ce_targets, ce_weights, ce_bias, opt_ce_tiles, opt_ce_seq_chunk);
+                        ce_targets, ce_weights, ce_bias, opt_ce_tiles, opt_ce_seq_chunk,
+                        opt_ce_offload_logsoftmax);
                 ggml_set_output(fused_loss);
                 struct ggml_cgraph * gf_fused = ggml_new_graph_custom(
                         opt_cached_compute_ctx.get(), size_gf, /*grads =*/ true);
