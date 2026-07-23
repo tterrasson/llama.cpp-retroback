@@ -2787,6 +2787,11 @@ extern "C" {
     //   weights : [n_tokens]          F32 per-token coefficient (may be negative)
     //   bias    : [n_vocab] F32, or NULL for no bias
     // Result is the scalar loss, already averaged over the active tokens.
+    // retro delta (plan rl/OPTIMIZE feature 1): seq_chunk caps how many tokens of
+    // the flattened (batch x seq) axis are processed at once, bounding the tiled
+    // logits intermediate to [n_vocab/n_tiles, seq_chunk] instead of
+    // [n_vocab/n_tiles, n_tokens]. 0 means "all tokens at once" (unchanged). The
+    // result is invariant to seq_chunk; only the peak footprint changes.
     GGML_API struct ggml_tensor * ggml_fused_sparse_ce(
             struct ggml_context * ctx,
             struct ggml_tensor  * h,
@@ -2794,12 +2799,13 @@ extern "C" {
             struct ggml_tensor  * targets,
             struct ggml_tensor  * weights,
             struct ggml_tensor  * bias, // may be NULL
-            int                   n_tiles);
+            int                   n_tiles,
+            int                   seq_chunk);
 
     // Gradient of ggml_fused_sparse_ce wrt the hidden states `h`.
     //   a       : scalar gradient of the loss result
     //   h, w, targets, weights, bias : the forward inputs (bias may be NULL)
-    // Result has the shape of `h`.
+    // Result has the shape of `h`. seq_chunk has the same meaning as above.
     GGML_API struct ggml_tensor * ggml_fused_sparse_ce_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2808,7 +2814,8 @@ extern "C" {
             struct ggml_tensor  * targets,
             struct ggml_tensor  * weights,
             struct ggml_tensor  * bias, // may be NULL
-            int                   n_tiles);
+            int                   n_tiles,
+            int                   seq_chunk);
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf
