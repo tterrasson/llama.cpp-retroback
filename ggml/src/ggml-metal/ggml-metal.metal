@@ -2898,10 +2898,8 @@ template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta
 // That is the shape the CUDA port measured at 3.7 s per launch and 99% of
 // training wall-clock before it was reparallelised the same way.
 //
-// NOTE: unlike every other backend in this fork, this kernel has never been
-// compiled or run (no Metal toolchain in the environment that wrote it). It
-// is a careful line-by-line port of the verified CUDA/Vulkan/CPU references,
-// but treat it as unverified until it has run on real Metal hardware.
+// Validated against the CPU reference on Apple M1 for scalar-gate/K=1 and
+// KDA/K=3 cases (tests/metal_ops.rs).
 kernel void kernel_gated_delta_net_back_f32(
         constant ggml_metal_kargs_gated_delta_net_back & args,
         device const float * data_q     [[buffer(1)]],
@@ -3249,8 +3247,8 @@ kernel void kernel_gated_delta_net_back_f32(
 // new-token region when n_seq_tokens < K -- exactly the original loop's
 // `std::max<int64_t>(0, ...)`.
 //
-// NOTE: like kernel_gated_delta_net_back_f32 above, this kernel has never been
-// compiled or run. Treat it as unverified until it has run on Metal hardware.
+// Validated bit-for-bit against the CPU reference on Apple M1 for K=1, K>1,
+// and n_seq_tokens < K (tests/metal_ops.rs).
 kernel void kernel_conv_rs_gather_f32(
         constant ggml_metal_kargs_conv_rs_gather & args,
         device const char  * src0,
