@@ -2387,6 +2387,7 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    uint32_t res;
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
@@ -2394,11 +2395,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
-    }
-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-    for (const auto & lora : model.loras) {
-        res += lora->get_n_nodes();
+        res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+    } else {
+        res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+        for (const auto & lora : model.loras) {
+            res += lora->get_n_nodes();
+        }
     }
     // retro delta: the training path (llama_opt_epoch -> ggml_opt_build) duplicates this
     // forward graph and expands a backward + optimizer-step graph into a copy of the SAME
@@ -2406,11 +2408,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     // + AdamW steps needs a multiple of the forward node budget, so reserve that headroom
     // here. Without it, ggml_build_backward_expand() overflows the graph and aborts on
     // GGML_ASSERT(cgraph->n_nodes < cgraph->size) as soon as more than a couple of layers are
-    // trained. Hybrid SSM blocks (Mamba/Falcon-H1) are especially node-heavy in the backward
-    // pass: each ssm_scan/ssm_conv expands into a dedicated *_back op plus view/reshape/cont
-    // and gradient-accumulation nodes, so 4x is used to cover them. This only grows cheap graph
-    // metadata (node pointers + hash set); activation buffers are still sized from the nodes
-    // actually used, so inference cost is unchanged.
+    // trained. Hybrid SSM blocks (Mamba/Falcon-H1, and the gated-delta-net hybrids above) are
+    // especially node-heavy in the backward pass: each ssm_scan/ssm_conv (or GDN) expands into
+    // a dedicated *_back op plus view/reshape/cont and gradient-accumulation nodes, so 4x is
+    // used to cover them. This only grows cheap graph metadata (node pointers + hash set);
+    // activation buffers are still sized from the nodes actually used, so inference cost is
+    // unchanged.
     res *= 4u;
     return res;
 }
