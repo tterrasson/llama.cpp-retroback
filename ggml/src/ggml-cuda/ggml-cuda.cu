@@ -5198,7 +5198,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_FLASH_ATTN_BACK: {
             // retro delta: reference FA backward (flash-attn-back.cu). q/dO/dst F32,
-            // K/V F16 or F32 (same type), optional F16 mask, no sinks, head dims <= 128.
+            // K/V F16 or F32 (same type), optional F16 mask, no sinks, head dims
+            // <= FA_BACK_MAX_D (the kernel's widest per-lane register bucket).
             const ggml_tensor * q = op->src[0];
             const ggml_tensor * k = op->src[1];
             const ggml_tensor * v = op->src[2];
@@ -5219,7 +5220,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             if (mask && mask->type != GGML_TYPE_F16) {
                 return false;
             }
-            if (q->ne[0] > 128 || v->ne[0] > 128) {
+            if (q->ne[0] > FA_BACK_MAX_D || v->ne[0] > FA_BACK_MAX_D) {
+                return false;
+            }
+            // KV gradient window: contiguous I32 row indices, one per window row
+            // and stream (see ggml_flash_attn_ext_set_grad_window).
+            const ggml_tensor * kv_idxs = op->src[9];
+            if (kv_idxs && (kv_idxs->type != GGML_TYPE_I32 || !ggml_is_contiguous(kv_idxs))) {
                 return false;
             }
             return q->ne[2] % k->ne[2] == 0;
