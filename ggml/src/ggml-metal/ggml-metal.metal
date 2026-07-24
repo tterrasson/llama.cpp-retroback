@@ -2884,6 +2884,20 @@ template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta
 // unique per (head, seq) and written directly. The caller zeroes `dst`
 // before dispatch.
 //
+// One *threadgroup* per (head, sequence) unit. The token scan is inherently
+// sequential, but every step inside it is O(S_v^2) and is spread across the
+// threadgroup: the state matrices are walked flat (coalesced, thread-stride),
+// the reductions over the contiguous `i` axis use one SIMD group per column
+// `j`, and the reductions over `j` give each thread a whole row `i` (also
+// coalesced, since threads then differ only in the contiguous index). The nine
+// per-token vectors live in threadgroup memory, sized dynamically by the
+// caller, so there is no cap on S_v.
+//
+// An earlier revision ran one *thread* per (head, sequence) -- 64 threads for
+// Qwen3.5 at n_seqs=4, each serially grinding n_tokens * S_v^2 scalar FLOPs.
+// That is the shape the CUDA port measured at 3.7 s per launch and 99% of
+// training wall-clock before it was reparallelised the same way.
+//
 // NOTE: unlike every other backend in this fork, this kernel has never been
 // compiled or run (no Metal toolchain in the environment that wrote it). It
 // is a careful line-by-line port of the verified CUDA/Vulkan/CPU references,
@@ -2899,15 +2913,22 @@ kernel void kernel_gated_delta_net_back_f32(
         device const float * data_grad  [[buffer(7)]],
         device       float * data_dst   [[buffer(8)]],
         device       float * data_scratch [[buffer(9)]],
+        threadgroup  float * smem       [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 ntg  [[threads_per_threadgroup]],
-        uint3 tpitg[[thread_position_in_threadgroup]]) {
-    const uint tid = tgpig.x*ntg.x + tpitg.x;
-    if (tid >= (uint) (args.H*args.n_seqs)) {
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  nsg  [[simdgroups_per_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]]) {
+    const uint unit = tgpig.x;
+    if (unit >= (uint) (args.H*args.n_seqs)) {
         return;
     }
-    const uint iv1 = tid % (uint) args.H;
-    const uint iv3 = tid / (uint) args.H;
+    const uint tid  = tpitg.x;
+    const uint nthr = ntg.x;
+
+    const uint iv1 = unit % (uint) args.H;
+    const uint iv3 = unit / (uint) args.H;
 
     const uint iq1 = iv1 % (uint) args.neq1;
     const uint ik1 = iv1 % (uint) args.nek1;
@@ -2940,27 +2961,44 @@ kernel void kernel_gated_delta_net_back_f32(
     const uint g_beta_off  = g_g_off + n_g;
     const uint g_state_off = g_beta_off + n_beta;
 
+    // The trajectory dominates; S1/Snew/dS/dS1 are the four working matrices.
+    // pre/delta/gexp/dpre/ddelta moved to threadgroup memory.
     const uint traj_stride = n_tokens * SS;
-    const uint per_thread   = traj_stride + 4u*SS + 5u*S_v;
-    const uint base   = tid * per_thread;
-    const uint traj    = base;
-    const uint S1      = traj + traj_stride;
-    const uint Snew     = S1 + SS;
-    const uint dS       = Snew + SS;
-    const uint dS1      = dS + SS;
-    const uint pre      = dS1 + SS;
-    const uint delta    = pre + S_v;
-    const uint gexp     = delta + S_v;
-    const uint dpre     = gexp + S_v;
-    const uint ddelta   = dpre + S_v;
+    const uint per_unit    = traj_stride + 4u*SS;
+    const uint base = unit * per_unit;
+    const uint traj = base;
+    const uint S1   = traj + traj_stride;
+    const uint Snew = S1 + SS;
+    const uint dS   = Snew + SS;
+    const uint dS1  = dS + SS;
+
+    threadgroup float * s_k      = smem;
+    threadgroup float * s_v      = s_k + S_v;
+    threadgroup float * s_q      = s_v + S_v;
+    threadgroup float * s_do     = s_q + S_v;
+    threadgroup float * s_gexp   = s_do + S_v;
+    threadgroup float * s_pre    = s_gexp + S_v;
+    threadgroup float * s_delta  = s_pre + S_v;
+    threadgroup float * s_dpre   = s_delta + S_v;
+    threadgroup float * s_ddelta = s_dpre + S_v;
+    threadgroup float * s_red    = s_ddelta + S_v;
+
+    // Flat walk of an S_v*S_v matrix keeping (i, j) in step without a modulo in
+    // the inner loop. i_step is nthr % S_v, so it is always < S_v and a single
+    // correction per step suffices.
+    const uint i0     = tid % S_v;
+    const uint j0     = tid / S_v;
+    const uint i_step = nthr % S_v;
+    const uint j_step = nthr / S_v;
 
     device atomic_float * atomic_dst = (device atomic_float *) data_dst;
 
     // ---- forward recompute: fill the S_prev trajectory ----
     const uint s0 = iv3*state_seq_stride + iv1*SS;
-    for (uint n = 0u; n < SS; ++n) {
+    for (uint n = tid; n < SS; n += nthr) {
         data_scratch[traj + n] = data_state[s0 + n];
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     for (uint t = 0u; t + 1u < n_tokens; ++t) {
         const uint k_off  = ik3*(uint)args.sk3 + t*(uint)args.sk2 + ik1*(uint)args.sk1;
@@ -2972,31 +3010,52 @@ kernel void kernel_gated_delta_net_back_f32(
         const uint S_prev = traj + t*SS;
         const uint S_next = traj + (t+1u)*SS;
 
-        if (kda) {
-            for (uint i = 0u; i < S_v; ++i) { data_scratch[gexp+i] = exp(data_g[g_off+i]); }
-        } else {
-            const float gv = exp(data_g[g_off]);
-            for (uint i = 0u; i < S_v; ++i) { data_scratch[gexp+i] = gv; }
+        for (uint i = tid; i < S_v; i += nthr) {
+            s_k[i]    = data_k[k_off + i];
+            s_v[i]    = data_v[v_off + i];
+            s_gexp[i] = exp(data_g[g_off + (kda ? i : 0u)]);
         }
-        for (uint j = 0u; j < S_v; ++j) {
-            for (uint i = 0u; i < S_v; ++i) {
-                data_scratch[S1 + i + j*S_v] = data_scratch[S_prev + i + j*S_v] * data_scratch[gexp+i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint n = tid, i = i0; n < SS; n += nthr) {
+            data_scratch[S1 + n] = data_scratch[S_prev + n] * s_gexp[i];
+            i += i_step;
+            if (i >= S_v) { i -= S_v; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+        // s_pre[j] = sum_i S1[i + j*S_v] * s_k[i], one SIMD group per column.
+        for (uint j = sgitg; j < S_v; j += nsg) {
+            float acc = 0.0f;
+            for (uint i = tiisg; i < S_v; i += 32u) {
+                acc += data_scratch[S1 + i + j*S_v] * s_k[i];
+            }
+            acc = simd_sum(acc);
+            if (tiisg == 0u) {
+                s_pre[j] = acc;
             }
         }
-        for (uint j = 0u; j < S_v; ++j) {
-            float sum = 0.0f;
-            for (uint i = 0u; i < S_v; ++i) { sum += data_scratch[S1+i+j*S_v] * data_k[k_off+i]; }
-            data_scratch[delta+j] = (data_v[v_off+j] - sum) * beta_val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint j = tid; j < S_v; j += nthr) {
+            s_delta[j] = (s_v[j] - s_pre[j]) * beta_val;
         }
-        for (uint j = 0u; j < S_v; ++j) {
-            for (uint i = 0u; i < S_v; ++i) {
-                data_scratch[S_next+i+j*S_v] = data_scratch[S1+i+j*S_v] + data_k[k_off+i]*data_scratch[delta+j];
-            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint n = tid, i = i0, j = j0; n < SS; n += nthr) {
+            data_scratch[S_next + n] = data_scratch[S1 + n] + s_k[i]*s_delta[j];
+            i += i_step;
+            j += j_step;
+            if (i >= S_v) { i -= S_v; ++j; }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
 
     // ---- reverse scan ----
-    for (uint n = 0u; n < SS; ++n) { data_scratch[dS+n] = 0.0f; }
+    for (uint n = tid; n < SS; n += nthr) {
+        data_scratch[dS + n] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     for (int ti = (int) n_tokens - 1; ti >= 0; --ti) {
         const uint t = (uint) ti;
@@ -3008,105 +3067,210 @@ kernel void kernel_gated_delta_net_back_f32(
         const uint g_off = gb_off * (kda ? S_v : 1u);
 
         const uint S_prev = traj + t*SS;
+        const uint d_out  = (iv3*n_tokens*H + t*H + iv1) * S_v;
 
-        if (kda) {
-            for (uint i = 0u; i < S_v; ++i) { data_scratch[gexp+i] = exp(data_g[g_off+i]); }
-        } else {
-            const float gv = exp(data_g[g_off]);
-            for (uint i = 0u; i < S_v; ++i) { data_scratch[gexp+i] = gv; }
+        for (uint i = tid; i < S_v; i += nthr) {
+            s_k[i]    = data_k[k_off + i];
+            s_v[i]    = data_v[v_off + i];
+            s_q[i]    = data_q[q_off + i];
+            s_do[i]   = data_grad[d_out + i];
+            s_gexp[i] = exp(data_g[g_off + (kda ? i : 0u)]);
         }
-        for (uint j = 0u; j < S_v; ++j) {
-            for (uint i = 0u; i < S_v; ++i) {
-                data_scratch[S1+i+j*S_v] = data_scratch[S_prev+i+j*S_v] * data_scratch[gexp+i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint n = tid, i = i0; n < SS; n += nthr) {
+            data_scratch[S1 + n] = data_scratch[S_prev + n] * s_gexp[i];
+            i += i_step;
+            if (i >= S_v) { i -= S_v; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+        for (uint j = sgitg; j < S_v; j += nsg) {
+            float acc = 0.0f;
+            for (uint i = tiisg; i < S_v; i += 32u) {
+                acc += data_scratch[S1 + i + j*S_v] * s_k[i];
+            }
+            acc = simd_sum(acc);
+            if (tiisg == 0u) {
+                s_pre[j] = acc;
             }
         }
-        for (uint j = 0u; j < S_v; ++j) {
-            float sum = 0.0f;
-            for (uint i = 0u; i < S_v; ++i) { sum += data_scratch[S1+i+j*S_v] * data_k[k_off+i]; }
-            data_scratch[pre+j]   = sum;
-            data_scratch[delta+j] = (data_v[v_off+j] - sum) * beta_val;
-        }
-        for (uint j = 0u; j < S_v; ++j) {
-            for (uint i = 0u; i < S_v; ++i) {
-                data_scratch[Snew+i+j*S_v] = data_scratch[S1+i+j*S_v] + data_k[k_off+i]*data_scratch[delta+j];
-            }
-        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const uint d_out = (iv3*n_tokens*H + t*H + iv1) * S_v;
+        for (uint j = tid; j < S_v; j += nthr) {
+            s_delta[j] = (s_v[j] - s_pre[j]) * beta_val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        for (uint n = tid, i = i0, j = j0; n < SS; n += nthr) {
+            data_scratch[Snew + n] = data_scratch[S1 + n] + s_k[i]*s_delta[j];
+            i += i_step;
+            j += j_step;
+            if (i >= S_v) { i -= S_v; ++j; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+        // dS += scale * outer(q, d_out); grad_q = scale * Snew . d_out
         const uint gq_out = g_q_off + S_v*(iq1 + neq1*(t + n_tokens*iq3));
-        for (uint i = 0u; i < S_v; ++i) {
+        for (uint i = tid; i < S_v; i += nthr) {
+            const float q_i = s_q[i];
             float dqi = 0.0f;
             for (uint j = 0u; j < S_v; ++j) {
-                data_scratch[dS+i+j*S_v] += args.scale * data_grad[d_out+j] * data_q[q_off+i];
-                dqi += data_scratch[Snew+i+j*S_v] * data_grad[d_out+j];
+                data_scratch[dS + i + j*S_v] += args.scale * s_do[j] * q_i;
+                dqi += data_scratch[Snew + i + j*S_v] * s_do[j];
             }
-            atomic_fetch_add_explicit(&atomic_dst[gq_out+i], args.scale * dqi, memory_order_relaxed);
+            atomic_fetch_add_explicit(&atomic_dst[gq_out + i], args.scale * dqi, memory_order_relaxed);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
         const uint target_slot = n_tokens - 1u - t;
         if (target_slot < (uint) args.K) {
             const uint d_snap = attn_score_elems + target_slot*state_size_per_snap + (iv3*H+iv1)*SS;
-            for (uint n = 0u; n < SS; ++n) {
-                data_scratch[dS+n] += data_grad[d_snap+n];
+            for (uint n = tid; n < SS; n += nthr) {
+                data_scratch[dS + n] += data_grad[d_snap + n];
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
         }
 
         // step 3 backward: S_new = S1 + outer(k, delta)
-        for (uint n = 0u; n < SS; ++n) { data_scratch[dS1+n] = data_scratch[dS+n]; }
-        for (uint j = 0u; j < S_v; ++j) { data_scratch[ddelta+j] = 0.0f; }
+        for (uint n = tid; n < SS; n += nthr) {
+            data_scratch[dS1 + n] = data_scratch[dS + n];
+        }
+        for (uint j = sgitg; j < S_v; j += nsg) {
+            float acc = 0.0f;
+            for (uint i = tiisg; i < S_v; i += 32u) {
+                acc += data_scratch[dS + i + j*S_v] * s_k[i];
+            }
+            acc = simd_sum(acc);
+            if (tiisg == 0u) {
+                s_ddelta[j] = acc;
+            }
+        }
         const uint gk_out = g_k_off + S_v*(ik1 + nek1*(t + n_tokens*ik3));
-        for (uint i = 0u; i < S_v; ++i) {
+        for (uint i = tid; i < S_v; i += nthr) {
             float dki = 0.0f;
             for (uint j = 0u; j < S_v; ++j) {
-                dki += data_scratch[dS+i+j*S_v] * data_scratch[delta+j];
-                data_scratch[ddelta+j] += data_scratch[dS+i+j*S_v] * data_k[k_off+i];
+                dki += data_scratch[dS + i + j*S_v] * s_delta[j];
             }
-            atomic_fetch_add_explicit(&atomic_dst[gk_out+i], dki, memory_order_relaxed);
+            atomic_fetch_add_explicit(&atomic_dst[gk_out + i], dki, memory_order_relaxed);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
         // step 2 backward: delta[j] = beta*(v[j] - pre[j])
-        float dbeta_t = 0.0f;
-        for (uint j = 0u; j < S_v; ++j) { data_scratch[dpre+j] = -data_scratch[ddelta+j]*beta_val; }
-        for (uint j = 0u; j < S_v; ++j) {
-            dbeta_t += data_scratch[ddelta+j] * (data_v[v_off+j] - data_scratch[pre+j]);
-            data_dst[g_v_off + j + S_v*(iv1 + H*(t + n_tokens*iv3))] += data_scratch[ddelta+j]*beta_val;
+        float dbeta_partial = 0.0f;
+        for (uint j = tid; j < S_v; j += nthr) {
+            const float dd = s_ddelta[j];
+            s_dpre[j] = -dd * beta_val;
+            dbeta_partial += dd * (s_v[j] - s_pre[j]);
+            data_dst[g_v_off + j + S_v*(iv1 + H*(t + n_tokens*iv3))] += dd * beta_val;
         }
-        data_dst[g_beta_off + iv1 + H*(t + n_tokens*iv3)] += dbeta_t;
-        for (uint j = 0u; j < S_v; ++j) {
-            for (uint i = 0u; i < S_v; ++i) {
-                data_scratch[dS1+i+j*S_v] += data_scratch[dpre+j]*data_k[k_off+i];
+        {
+            float v = simd_sum(dbeta_partial);
+            if (tiisg == 0u) {
+                s_red[sgitg] = v;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float dbeta_t = 0.0f;
+            for (uint i = 0u; i < nsg; ++i) {
+                dbeta_t += s_red[i];
+            }
+            if (tid == 0u) {
+                data_dst[g_beta_off + iv1 + H*(t + n_tokens*iv3)] += dbeta_t;
             }
         }
-        for (uint i = 0u; i < S_v; ++i) {
-            float dki2 = 0.0f;
-            for (uint j = 0u; j < S_v; ++j) { dki2 += data_scratch[dpre+j] * data_scratch[S1+i+j*S_v]; }
-            atomic_fetch_add_explicit(&atomic_dst[gk_out+i], dki2, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint n = tid, i = i0, j = j0; n < SS; n += nthr) {
+            data_scratch[dS1 + n] += s_dpre[j] * s_k[i];
+            i += i_step;
+            j += j_step;
+            if (i >= S_v) { i -= S_v; ++j; }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+        for (uint i = tid; i < S_v; i += nthr) {
+            float dki2 = 0.0f;
+            for (uint j = 0u; j < S_v; ++j) {
+                dki2 += s_dpre[j] * data_scratch[S1 + i + j*S_v];
+            }
+            atomic_fetch_add_explicit(&atomic_dst[gk_out + i], dki2, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
         // step 1 backward: S1[i,j] = S_prev[i,j] * gexp[i]
         if (kda) {
             const uint gg_out = g_g_off + S_v*(iv1 + H*(t + n_tokens*iv3));
-            for (uint i = 0u; i < S_v; ++i) {
+            for (uint i = tid; i < S_v; i += nthr) {
+                const float ge = s_gexp[i];
                 float dgexp_i = 0.0f;
                 for (uint j = 0u; j < S_v; ++j) {
-                    dgexp_i += data_scratch[dS1+i+j*S_v] * data_scratch[S_prev+i+j*S_v];
-                    data_scratch[dS+i+j*S_v] = data_scratch[dS1+i+j*S_v] * data_scratch[gexp+i];
+                    const uint idx = i + j*S_v;
+                    dgexp_i += data_scratch[dS1 + idx] * data_scratch[S_prev + idx];
+                    data_scratch[dS + idx] = data_scratch[dS1 + idx] * ge;
                 }
-                data_dst[gg_out+i] += dgexp_i * data_scratch[gexp+i];
+                data_dst[gg_out + i] += dgexp_i * ge;
             }
         } else {
+            const float ge = s_gexp[0];
+            float dgexp_partial = 0.0f;
+            for (uint n = tid; n < SS; n += nthr) {
+                dgexp_partial += data_scratch[dS1 + n] * data_scratch[S_prev + n];
+                data_scratch[dS + n] = data_scratch[dS1 + n] * ge;
+            }
+            float v = simd_sum(dgexp_partial);
+            if (tiisg == 0u) {
+                s_red[sgitg] = v;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
             float dgexp_sum = 0.0f;
-            for (uint n = 0u; n < SS; ++n) { dgexp_sum += data_scratch[dS1+n]*data_scratch[S_prev+n]; }
-            for (uint n = 0u; n < SS; ++n) { data_scratch[dS+n] = data_scratch[dS1+n]*data_scratch[gexp+0]; }
-            data_dst[g_g_off + iv1 + H*(t + n_tokens*iv3)] += dgexp_sum * data_scratch[gexp+0];
+            for (uint i = 0u; i < nsg; ++i) {
+                dgexp_sum += s_red[i];
+            }
+            if (tid == 0u) {
+                data_dst[g_g_off + iv1 + H*(t + n_tokens*iv3)] += dgexp_sum * ge;
+            }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
 
     const uint gs_out = g_state_off + iv3*state_seq_stride + iv1*SS;
-    for (uint n = 0u; n < SS; ++n) {
-        data_dst[gs_out+n] += data_scratch[dS+n];
+    for (uint n = tid; n < SS; n += nthr) {
+        data_dst[gs_out + n] += data_scratch[dS + n];
     }
+}
+
+// retro delta: gathers the K overlapping causal-conv rollback snapshot windows
+// used by the shared-prefix GRPO scorer's recurrent-state rollback (see
+// build_conv_state / [TAG_RECURRENT_ROLLBACK_SPLITS] in delta-net-base.cpp) in
+// a single dispatch, replacing a host-side loop that previously built K
+// separate view+cpy graph nodes per call. One thread per output element; every
+// element is an independent gather. Slot 0 is the window ending at the last
+// token, slot s reads s tokens further back, clamped to the start of the
+// new-token region when n_seq_tokens < K -- exactly the original loop's
+// `std::max<int64_t>(0, ...)`.
+//
+// NOTE: like kernel_gated_delta_net_back_f32 above, this kernel has never been
+// compiled or run. Treat it as unverified until it has run on Metal hardware.
+kernel void kernel_conv_rs_gather_f32(
+        constant ggml_metal_kargs_conv_rs_gather & args,
+        device const char  * src0,
+        device       float * dst,
+        uint gid[[thread_position_in_grid]]) {
+    if ((int64_t) gid >= args.total) {
+        return;
+    }
+
+    uint r = gid;
+    const uint k    = r % (uint) args.kernel_m1; r /= (uint) args.kernel_m1;
+    const uint c    = r % (uint) args.n_channels; r /= (uint) args.n_channels;
+    const uint s    = r % (uint) args.n_seqs;
+    const uint slot = r / (uint) args.n_seqs;
+
+    const int64_t back  = args.base - (int64_t) slot;
+    const int64_t s_idx = back > 0 ? back : 0;
+
+    dst[gid] = *(device const float *) (src0 +
+            (s_idx + (int64_t) k)*args.nb00 + (int64_t) c*args.nb01 + (int64_t) s*args.nb02);
 }
 
 constant short FC_solve_tri_nsg [[function_constant(FC_SOLVE_TRI + 0)]];
