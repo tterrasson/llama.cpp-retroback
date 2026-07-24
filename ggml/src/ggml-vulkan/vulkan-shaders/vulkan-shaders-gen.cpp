@@ -630,8 +630,15 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 }
 
 void process_shaders() {
-    string_to_spv("flash_attn_back_q_f32_f16",  "flash_attn_back_q.comp",  {});
-    string_to_spv("flash_attn_back_kv_f32_f16", "flash_attn_back_kv.comp", {});
+    // retro delta: one variant per head-dim bucket (see flash_attn_back_q.comp).
+    // The suffix is the largest head dimension the variant covers.
+    static const char * fa_back_buckets[][2] = {{"128", "4"}, {"256", "8"}};
+    for (const auto & bucket : fa_back_buckets) {
+        string_to_spv(std::string("flash_attn_back_q_f32_f16_d")  + bucket[0],
+                "flash_attn_back_q.comp",  {{"FA_BACK_SLOTS", bucket[1]}});
+        string_to_spv(std::string("flash_attn_back_kv_f32_f16_d") + bucket[0],
+                "flash_attn_back_kv.comp", {{"FA_BACK_SLOTS", bucket[1]}});
+    }
 
     // matmul
     for (const MatMulIdType& matmul_id_type : {MatMulIdType::NONE, MatMulIdType::DEFAULT, MatMulIdType::SUBGROUP}) {
