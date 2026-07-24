@@ -12,6 +12,17 @@ layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 #define FA_BACK_SLOTS 4
 #endif
 
+// retro delta: KV cache element type. Both F16 and F32 are built, and F32 is not
+// optional: `cap_flash_attn_back` is probed with an F32 cache
+// (retro_backend.cpp) and clearing that gate is the precondition for the F16
+// probe -- and therefore for `kv_dtype = "f16"` -- ever running. Mirrors the CUDA
+// and Metal ports.
+#ifdef KV_F32
+#define KV_TYPE float
+#else
+#define KV_TYPE float16_t
+#endif
+
 layout(push_constant) uniform parameter {
     uint N; uint KV; uint HSK; uint HSV;
     uint n_head; uint n_head_kv; uint n_batch;
@@ -24,8 +35,8 @@ layout(push_constant) uniform parameter {
 } p;
 
 layout(binding = 0) readonly buffer Q      { float     q[]; };
-layout(binding = 1) readonly buffer K      { float16_t k[]; };
-layout(binding = 2) readonly buffer V      { float16_t v[]; };
+layout(binding = 1) readonly buffer K      { KV_TYPE   k[]; };
+layout(binding = 2) readonly buffer V      { KV_TYPE   v[]; };
 layout(binding = 3) readonly buffer Mask   { float16_t mask[]; };
 layout(binding = 4) readonly buffer Out    { float     out_data[]; };
 layout(binding = 5) readonly buffer DOut   { float     dout[]; };
