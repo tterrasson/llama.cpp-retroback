@@ -4862,11 +4862,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_OUT_PROD:
             // retro delta: quantized src0 is dequantized to F32 in ggml_cuda_out_prod
             // (contiguous packed layout required), so any quant type with a to_fp32
-            // kernel is accepted in addition to F32.
+            // kernel is accepted in addition to F32. The dequantization runs on
+            // slices of whole src0 columns, so a column must be a whole number of
+            // quantization blocks -- true of every GGUF weight, and required here so
+            // an exotic shape falls back to another backend instead of aborting.
             return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    (op->src[0]->type == GGML_TYPE_F32 ||
                     (ggml_is_quantized(op->src[0]->type) && ggml_is_contiguous(op->src[0]) &&
-                     op->src[0]->nb[0] == ggml_type_size(op->src[0]->type)));
+                     op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
+                     op->src[0]->ne[0] % ggml_blck_size(op->src[0]->type) == 0));
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
