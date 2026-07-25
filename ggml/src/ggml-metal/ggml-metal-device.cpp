@@ -627,6 +627,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_
 // kernel_flash_attn_back_<pass>_f32_<kv type>_d<head-dim bucket>. Both passes must
 // resolve the *same* variant -- the dK/dV pass consumes the per-query LSE/delta
 // the dQ pass wrote -- so they share this builder.
+//
+// Metal stops at the 256 bucket: CUDA and Vulkan carry a 512 variant for
+// Gemma-4's global-attention layers, but adding one here without running
+// tests/metal_ops.rs on real hardware is exactly the "report support, produce
+// wrong gradients" failure the cap exists to prevent. Such models fall back to
+// the materialized F32 attention graph on Metal.
+static_assert(GGML_METAL_FA_BACK_MAX_D <= GGML_FLASH_ATTN_BACK_MAX_HEAD_DIM,
+              "advertised head-dim cap exceeds what the probe harness can exercise");
+
 static void ggml_metal_fa_back_pipeline_name(char * name, size_t len, const ggml_tensor * op, const char * pass) {
     GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_BACK);
 

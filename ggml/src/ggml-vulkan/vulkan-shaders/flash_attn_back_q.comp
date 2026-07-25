@@ -7,9 +7,9 @@
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 // retro delta: head-dim elements owned by each invocation, one variant per
-// bucket (4 -> head dim <= 128, 8 -> <= 256, 18 -> <= 576). Only registers scale
-// with the head dimension here, so wide-head models cost a deeper accumulator
-// and nothing else; narrow models keep the shallow variant. Mirrors the CUDA
+// bucket (4 -> head dim <= 128, 8 -> <= 256, 16 -> <= 512, 18 would be <= 576).
+// Only registers scale with the head dimension here, so wide-head models cost a
+// deeper accumulator and nothing else; narrow models keep the shallow variant. Mirrors the CUDA
 // bucket dispatch in ggml-cuda/flash-attn-back.cu.
 #ifndef FA_BACK_SLOTS
 #define FA_BACK_SLOTS 4

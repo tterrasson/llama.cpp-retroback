@@ -2495,6 +2495,15 @@ extern "C" {
             int32_t              kv_stride,
             int32_t              kv_stream0);
 
+    // retro delta: largest attention head dimension any backend may advertise
+    // support for on GGML_OP_FLASH_ATTN_BACK. Each backend keeps its own cap
+    // (FA_BACK_MAX_D, VK_FA_BACK_MAX_D, GGML_METAL_FA_BACK_MAX_D) and
+    // static_asserts it against this one, and the backend-agnostic capability
+    // probe harness validates requested shapes against it: a backend may cover
+    // less than this, never more than the harness can exercise. Raising it is
+    // therefore the *first* step of widening a backend, not an afterthought.
+#define GGML_FLASH_ATTN_BACK_MAX_HEAD_DIM 512
+
     // Which segments of the packed backward tensor are materialized.
     enum ggml_flash_attn_back_grad {
         GGML_FLASH_ATTN_BACK_GRAD_Q = 1 << 0,

@@ -502,10 +502,11 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
 enum vk_fa_back_bucket {
     FA_BACK_BUCKET_128,
     FA_BACK_BUCKET_256,
+    FA_BACK_BUCKET_512,
     FA_BACK_BUCKETS,
 };
 
-static const uint32_t vk_fa_back_bucket_max_d[FA_BACK_BUCKETS] = { 128, 256 };
+static const uint32_t vk_fa_back_bucket_max_d[FA_BACK_BUCKETS] = { 128, 256, 512 };
 
 // KV cache element type axis, orthogonal to the bucket. F32 is not optional:
 // `cap_flash_attn_back` is probed with an F32 cache (retro_backend.cpp) and
@@ -520,8 +521,12 @@ enum vk_fa_back_kv {
 // Largest head dimension any variant covers; the supports check gates on this.
 // Only raise it alongside a new shader variant *and* a gradient-parity test at
 // that head dimension -- an untested variant would report support and produce
-// silently wrong gradients rather than fail.
-#define VK_FA_BACK_MAX_D 256
+// silently wrong gradients rather than fail. Bounded by
+// GGML_FLASH_ATTN_BACK_MAX_HEAD_DIM, the ceiling the probe harness covers.
+#define VK_FA_BACK_MAX_D 512
+
+static_assert(VK_FA_BACK_MAX_D <= GGML_FLASH_ATTN_BACK_MAX_HEAD_DIM,
+              "advertised head-dim cap exceeds what the probe harness can exercise");
 
 static vk_fa_back_bucket ggml_vk_fa_back_select_bucket(uint32_t hsk, uint32_t hsv) {
     const uint32_t hs_max = std::max(hsk, hsv);
@@ -5367,8 +5372,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_128, 128);
     CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_256, 256);
+    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_512, 512);
     CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_128, 128);
     CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_256, 256);
+    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_512, 512);
 #undef CREATE_FA_BACK_PIPELINES
 
     for (auto &it : device->pipeline_fa_mask_opt) {
