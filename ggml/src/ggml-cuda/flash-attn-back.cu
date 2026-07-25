@@ -27,10 +27,13 @@
 //
 // REGS = ceil(max(hsk,hsv)/32) is a template parameter rather than a single
 // compile-time cap: the warp split means the head dimension only costs 4*REGS
-// registers per lane, so wide-head models (Qwen3.5/GDN at head_dim=256, MLA at
-// 576) fit fine — but instantiating everything at the widest bucket would make
-// the common head_dim<=128 models pay the extra registers and occupancy for
-// nothing. Dispatch picks the smallest bucket that covers the shape.
+// registers per lane (qv, dov, o_acc, dq), so wide-head models (Qwen3.5/GDN at
+// head_dim=256, Gemma-4's global-attention layers at 512, MLA at 576) fit fine
+// — but instantiating everything at the widest bucket would make the common
+// head_dim<=128 models pay the extra registers and occupancy for nothing.
+// Dispatch picks the smallest bucket that covers the shape. Note that 4*REGS is
+// the real number: 64 registers of accumulator at the 512 bucket, which costs
+// occupancy but stays far from the 255-register/thread ceiling.
 
 // Head-dimension elements owned by each lane, per bucket. Adding a bucket for a
 // wider head dimension (MLA at 576 would be REGS 18) is a two-line change here
@@ -38,11 +41,14 @@
 // head dimension, never on the strength of "it's the same code".
 #define FA_BACK_REGS_SMALL  4   // head dim <= 128 (most dense models)
 #define FA_BACK_REGS_WIDE   8   // head dim <= 256 (Qwen3.5/GDN, Gemma2)
+#define FA_BACK_REGS_XWIDE 16   // head dim <= 512 (Gemma-4 global-attn layers)
 
 // The supports check in ggml-cuda.cu gates on FA_BACK_MAX_D, so the widest
 // bucket must cover exactly that or shapes get accepted and then assert.
-static_assert(FA_BACK_REGS_WIDE*WARP_SIZE == FA_BACK_MAX_D,
+static_assert(FA_BACK_REGS_XWIDE*WARP_SIZE == FA_BACK_MAX_D,
               "widest kernel bucket must match the advertised head-dim cap");
+static_assert(FA_BACK_MAX_D <= GGML_FLASH_ATTN_BACK_MAX_HEAD_DIM,
+              "advertised head-dim cap exceeds what the probe harness can exercise");
 
 static __device__ __forceinline__ float fab_load(const char * base, int64_t idx,
                                                   int64_t stride0, bool is_f16) {
@@ -359,8 +365,11 @@ void ggml_cuda_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 
     if (hs_max <= FA_BACK_REGS_SMALL*WARP_SIZE) {
         FA_BACK_LAUNCH(FA_BACK_REGS_SMALL);
-    } else {
+    } else if (hs_max <= FA_BACK_REGS_WIDE*WARP_SIZE) {
         FA_BACK_LAUNCH(FA_BACK_REGS_WIDE);
+    } else {
+        // hs_max <= FA_BACK_MAX_D by the assert above, so this is the XWIDE case.
+        FA_BACK_LAUNCH(FA_BACK_REGS_XWIDE);
     }
 #undef FA_BACK_LAUNCH
     CUDA_CHECK(cudaGetLastError());
