@@ -1,0 +1,102 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_atomic_float : require
+
+#include "generic_head.glsl"
+#include "types.glsl"
+
+// retro delta: forward of the (Retroback-weighted) cross-entropy loss, the dual
+// of cross_entropy_loss_back.comp. Per row i1:
+//   log_softmax[c] = logits[i1,c] - row_max - log(Sum_c exp(logits[i1,c] - row_max))
+//   contrib        = -Sum_c labels[i1,c] * log_softmax[c]
+// and dst[0] = Sum_{i1} contrib / nactive.
+//
+// One workgroup owns one row, so the row reductions (max, sum-exp, dot with the
+// labels) stay inside shared memory and only the row's scalar contribution
+// crosses workgroups — atomically added into dst[0], which the host zero-fills
+// beforehand. This mirrors kernel_cross_entropy_loss_f32 on Metal rather than
+// CUDA's partials-buffer-then-sum, because the atomic keeps the op free of any
+// scratch allocation.
+//
+// nactive is precomputed on the host (op_params override, else the row count)
+// and passed in param1, exactly as in the backward. A row whose labels are all
+// zero contributes nothing on its own, so no per-row activity test is needed
+// here — the divisor already excludes it.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 128;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer L {A_TYPE data_logits[];};
+layout (binding = 1) readonly buffer Y {B_TYPE data_labels[];};
+layout (binding = 2) coherent buffer D {float  data_dst[];};
+
+shared FLOAT_TYPE sh_a[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (row >= p.KY) {
+        return;
+    }
+
+    // A batch made only of ignored labels has a zero loss; leave the zero-filled
+    // destination alone instead of dividing by zero.
+    if (p.param1 == 0.0f) {
+        return;
+    }
+
+    const uint nc   = p.KX;
+    const uint base = row * nc;
+
+    // row max
+    FLOAT_TYPE m = FLOAT_TYPE(-3.402823466e+38);
+    [[unroll]] for (uint col = tid; col < nc; col += BLOCK_SIZE) {
+        m = max(m, FLOAT_TYPE(data_logits[base + col]));
+    }
+    sh_a[tid] = m;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_a[tid] = max(sh_a[tid], sh_a[tid + s]);
+        }
+        barrier();
+    }
+    const FLOAT_TYPE row_max = sh_a[0];
+    barrier();
+
+    // sum(exp(logits - max))
+    FLOAT_TYPE se = FLOAT_TYPE(0);
+    [[unroll]] for (uint col = tid; col < nc; col += BLOCK_SIZE) {
+        se += exp(FLOAT_TYPE(data_logits[base + col]) - row_max);
+    }
+    sh_a[tid] = se;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_a[tid] += sh_a[tid + s];
+        }
+        barrier();
+    }
+    const FLOAT_TYPE log_sum = log(sh_a[0]);
+    barrier();
+
+    // Sum_c labels[c] * (logits[c] - max - log_sum)
+    FLOAT_TYPE sl = FLOAT_TYPE(0);
+    [[unroll]] for (uint col = tid; col < nc; col += BLOCK_SIZE) {
+        sl += (FLOAT_TYPE(data_logits[base + col]) - row_max - log_sum) * FLOAT_TYPE(data_labels[base + col]);
+    }
+    sh_a[tid] = sl;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_a[tid] += sh_a[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        atomicAdd(data_dst[0], float(-sh_a[0] / FLOAT_TYPE(p.param1)));
+    }
+}

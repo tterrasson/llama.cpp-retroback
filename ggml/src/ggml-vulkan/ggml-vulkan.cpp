@@ -825,6 +825,9 @@ struct vk_device_struct {
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
     uint32_t subgroup_max_size;
+    // retro delta: a 32-wide subgroup is available to the Flash Attention backward
+    // shaders, natively or through VK_EXT_subgroup_size_control. See where it is set.
+    bool fa_back_subgroup32;
     bool subgroup_require_full_support;
 
     // floor(log2(maxComputeWorkGroupInvocations))
@@ -1012,6 +1015,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_soft_max_f32, pipeline_soft_max_f32_f16;
     vk_pipeline pipeline_soft_max_f32_wg512, pipeline_soft_max_f32_f16_wg512;
     vk_pipeline pipeline_soft_max_back_f32;
+    vk_pipeline pipeline_cross_entropy_loss_f32; // retro delta
     vk_pipeline pipeline_cross_entropy_loss_back_f32;
 
     vk_pipeline pipeline_soft_max_large1_f32, pipeline_soft_max_large1_f32_f16;
@@ -1847,6 +1851,7 @@ struct vk_op_fused_sparse_ce_push_constants {
     uint32_t n_vocab;
     uint32_t h_stride; // elements between hidden-state columns
     uint32_t d_stride; // elements between grad_h columns (backward only)
+    uint32_t has_bias; // 1 when the head carries a per-vocab bias [n_vocab]
 };
 
 struct vk_op_ssm_scan_back_push_constants {
@@ -5364,12 +5369,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             flash_attn_back_kv_f32_##KV##_d##D##_data, "main", 9,                                \
             sizeof(vk_flash_attn_back_push_constants), {32, 1, 1}, {}, 1, true, true, 32)
 
-    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_128, 128);
-    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_256, 256);
-    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_512, 512);
-    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_128, 128);
-    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_256, 256);
-    CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_512, 512);
+    // retro delta: `required_subgroup_size = 32` above is what makes these usable on
+    // a wave64 device; where 32 is neither native nor selectable the request would
+    // assert, so the pipelines stay null and supports_op falls the op back to the CPU.
+    if (device->fa_back_subgroup32) {
+        CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_128, 128);
+        CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_256, 256);
+        CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F16, f16, FA_BACK_BUCKET_512, 512);
+        CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_128, 128);
+        CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_256, 256);
+        CREATE_FA_BACK_PIPELINES(FA_BACK_KV_F32, f32, FA_BACK_BUCKET_512, 512);
+    }
 #undef CREATE_FA_BACK_PIPELINES
 
     for (auto &it : device->pipeline_fa_mask_opt) {
@@ -5602,6 +5612,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_f32_f16_wg512, "soft_max_f32_f16_wg512", soft_max_f32_f16_len, soft_max_f32_f16_data, "main", 4, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 512 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_back_f32, "soft_max_back_f32", soft_max_back_f32_len, soft_max_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_back_f32, "cross_entropy_loss_back_f32", cross_entropy_loss_back_f32_len, cross_entropy_loss_back_f32_data, "main", 4, sizeof(vk_op_push_constants), {1, 1, 1}, { 128 }, 1);
+    // retro delta: the CE forward reduces each row inside its workgroup and adds
+    // the row's scalar contribution to dst[0] atomically, so it needs buffer F32
+    // atomic add — the same prerequisite as the fused sparse CE forward.
+    if (device->buffer_float32_atomic_add) {
+        ggml_vk_create_pipeline(device, device->pipeline_cross_entropy_loss_f32, "cross_entropy_loss_f32", cross_entropy_loss_f32_len, cross_entropy_loss_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { 128 }, 1);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_large1_f32,     "soft_max_large1_f32",     soft_max_large1_f32_len,     soft_max_large1_f32_data,     "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 4 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_soft_max_large2_f32,     "soft_max_large2_f32",     soft_max_large2_f32_len,     soft_max_large2_f32_data,     "main", 6, sizeof(vk_op_soft_max_push_constants), {1, 1, 1}, { 128, 4 }, 1, true);
@@ -5848,9 +5864,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // supports_op falls the op back to CPU.
     ggml_vk_create_pipeline(device, device->pipeline_fused_sparse_ce_count, "fused_sparse_ce_count", fused_sparse_ce_count_len, fused_sparse_ce_count_data, "main", 3, sizeof(vk_op_fused_sparse_ce_push_constants), {256, 1, 1}, {}, 1);
 #define CREATE_FUSED_SPARSE_CE(ENUM, NAME) \
-    ggml_vk_create_pipeline(device, device->pipeline_fused_sparse_ce_back[ENUM], "fused_sparse_ce_back_" #NAME, fused_sparse_ce_back_##NAME##_len, fused_sparse_ce_back_##NAME##_data, "main", 7, sizeof(vk_op_fused_sparse_ce_push_constants), {1, 1, 1}, {}, 1); \
+    ggml_vk_create_pipeline(device, device->pipeline_fused_sparse_ce_back[ENUM], "fused_sparse_ce_back_" #NAME, fused_sparse_ce_back_##NAME##_len, fused_sparse_ce_back_##NAME##_data, "main", 8, sizeof(vk_op_fused_sparse_ce_push_constants), {1, 1, 1}, {}, 1); \
     if (device->buffer_float32_atomic_add) { \
-        ggml_vk_create_pipeline(device, device->pipeline_fused_sparse_ce[ENUM], "fused_sparse_ce_" #NAME, fused_sparse_ce_##NAME##_len, fused_sparse_ce_##NAME##_data, "main", 6, sizeof(vk_op_fused_sparse_ce_push_constants), {1, 1, 1}, {}, 1); \
+        ggml_vk_create_pipeline(device, device->pipeline_fused_sparse_ce[ENUM], "fused_sparse_ce_" #NAME, fused_sparse_ce_##NAME##_len, fused_sparse_ce_##NAME##_data, "main", 7, sizeof(vk_op_fused_sparse_ce_push_constants), {1, 1, 1}, {}, 1); \
     }
     CREATE_FUSED_SPARSE_CE(GGML_TYPE_F32, f32);
     if (device->fp16) {
@@ -6672,6 +6688,20 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 subgroup_size_control_features.subgroupSizeControl;
 
         device->subgroup_require_full_support = subgroup_size_control_features.computeFullSubgroups;
+
+        // retro delta: the differentiable Flash Attention backward shaders assume a
+        // 32-wide subgroup (one subgroup per query row, `local_size_x = 32`). A
+        // device whose native subgroup is 32 satisfies that outright; otherwise the
+        // pipelines can *ask* for 32 through VK_EXT_subgroup_size_control, which is
+        // what unblocks AMD in wave64 — there the native subgroup is 64 but 32 is
+        // selectable, and without this the whole backward fell back to the CPU
+        // (docs/backends/UNIFY.md 3.1). A device that can neither report 32 nor
+        // select it keeps the fallback, and its FA-back pipelines are not created at
+        // all: requesting an unsupported size asserts inside ggml_vk_create_pipeline.
+        // Not qualifiable on this project's hardware — no wave64 GPU is accessible.
+        device->fa_back_subgroup32 = device->subgroup_size == 32 ||
+                (device->subgroup_size_control &&
+                 device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size);
 
 #if defined(VK_KHR_cooperative_matrix)
         device->coopmat_support = device->coopmat_support && coopmat_features.cooperativeMatrix;
@@ -8658,6 +8688,19 @@ static void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t 
     }
 
     // Fall back to GPU fillBuffer for non-UMA or non-host-visible buffers
+    ctx->s->buffer->buf.fillBuffer(dst->buffer, offset, size, c);
+}
+
+// retro delta: zero a buffer *inside* the command buffer, always.
+//
+// ggml_vk_buffer_memset_async above takes a host memset shortcut on a UMA device,
+// deferred until just before submission. That is fine for a buffer nothing else in
+// the submission writes, but it cannot be ordered against a GPU dispatch earlier in
+// the same command buffer: the host write always lands first. Any accumulator that
+// is cleared and re-filled more than once per graph therefore needs a real
+// fillBuffer, which the barriers around it can order. Used by the fused sparse CE
+// active-token counter, where the forward and the backward each clear it.
+static void ggml_vk_buffer_fill_cmd(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
     ctx->s->buffer->buf.fillBuffer(dst->buffer, offset, size, c);
 }
 
@@ -11983,6 +12026,19 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
     GGML_UNUSED(src3);
 }
 
+// retro delta: workgroup grid for the row-per-workgroup training ops (both
+// cross-entropy loss directions). The 512 x 512 x N folding keeps every axis
+// inside maxComputeWorkGroupCount; the shaders undo it with the same constants.
+static std::array<uint32_t, 3> ggml_vk_row_workgroups(uint32_t nr) {
+    if (nr > 262144) {
+        return { 512, 512, CEIL_DIV(nr, 262144) };
+    }
+    if (nr > 512) {
+        return { 512, CEIL_DIV(nr, 512), 1 };
+    }
+    return { nr, 1, 1 };
+}
+
 template<typename PC>
 static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst, ggml_op op, PC&& pc) {
     VK_LOG_DEBUG("ggml_vk_op_f32((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
@@ -12071,17 +12127,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         };
         break;
     case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
-        {
-            // one workgroup per logits/dst row (src0 is the scalar grad)
-            const uint32_t nr = ggml_nrows(dst);
-            if (nr > 262144) {
-                elements = { 512, 512, CEIL_DIV(nr, 262144) };
-            } else if (nr > 512) {
-                elements = { 512, CEIL_DIV(nr, 512), 1 };
-            } else {
-                elements = { nr, 1, 1 };
-            }
-        } break;
+        // one workgroup per logits/dst row (src0 is the scalar grad)
+        elements = ggml_vk_row_workgroups((uint32_t)ggml_nrows(dst));
+        break;
     case GGML_OP_SOLVE_TRI:
         {
             uint32_t nr = (uint32_t)(ne02 * ne03);
@@ -13091,7 +13139,11 @@ static vk_subbuffer ggml_vk_fused_sparse_ce_count(ggml_backend_vk_context * ctx,
     vk_pipeline pipeline = ctx->device->pipeline_fused_sparse_ce_count;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
-    ggml_vk_buffer_memset_async(subctx, ctx->prealloc_split_k, 0, 0, count_bytes);
+    // Must be a command-buffer fill, not a deferred host memset: the forward and
+    // the backward each clear this counter, and on a UMA device a host memset would
+    // land before *both* count dispatches instead of between them -- the second
+    // consumer then divides by 2*n_active and its gradient comes out halved.
+    ggml_vk_buffer_fill_cmd(subctx, ctx->prealloc_split_k, 0, 0, count_bytes);
     ggml_vk_sync_buffers(ctx, subctx);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -13108,6 +13160,7 @@ static void ggml_vk_fused_sparse_ce(ggml_backend_vk_context * ctx, vk_context& s
     const ggml_tensor * w       = dst->src[1]; // [n_embd, n_vocab]  F32/F16/Q8_0
     const ggml_tensor * targets = dst->src[2]; // [n_tokens] I32
     const ggml_tensor * weights = dst->src[3]; // [n_tokens] F32
+    const ggml_tensor * bias    = dst->src[4]; // [n_vocab] F32, may be null
 
     GGML_ASSERT(dst->buffer != nullptr);
     GGML_ASSERT(ggml_is_contiguous(w));
@@ -13118,6 +13171,7 @@ static void ggml_vk_fused_sparse_ce(ggml_backend_vk_context * ctx, vk_context& s
         (uint32_t) w->ne[1],
         (uint32_t) (h->nb[1] / sizeof(float)),
         0,
+        bias != nullptr ? 1u : 0u,
     };
 
     const vk_subbuffer count_buf = ggml_vk_fused_sparse_ce_count(ctx, subctx, targets, weights, pc);
@@ -13127,14 +13181,19 @@ static void ggml_vk_fused_sparse_ce(ggml_backend_vk_context * ctx, vk_context& s
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-    // The loss is accumulated with atomic adds, so start from zero.
-    ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
+    // The loss is accumulated with atomic adds, so start from zero. A
+    // command-buffer fill rather than a deferred host memset: gallocr may hand this
+    // scalar a buffer region an earlier node of the same graph still writes to, and
+    // on a UMA device a host memset would land before that write instead of after.
+    ggml_vk_buffer_fill_cmd(subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
     ggml_vk_sync_buffers(ctx, subctx);
 
+    // The bias binding must exist even when the head has none: bind the weights as
+    // a harmless stand-in and let has_bias keep the shader from reading it.
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, h), ggml_vk_tensor_subbuffer(ctx, w),
           ggml_vk_tensor_subbuffer(ctx, targets), ggml_vk_tensor_subbuffer(ctx, weights),
-          count_buf, dst_buf },
+          count_buf, dst_buf, ggml_vk_tensor_subbuffer(ctx, bias ? bias : weights) },
         pc, { pc.n_tokens, 1, 1 });
 }
 
@@ -13144,6 +13203,7 @@ static void ggml_vk_fused_sparse_ce_back(ggml_backend_vk_context * ctx, vk_conte
     const ggml_tensor * w       = dst->src[2]; // [n_embd, n_vocab]  F32/F16/Q8_0
     const ggml_tensor * targets = dst->src[3]; // [n_tokens] I32
     const ggml_tensor * weights = dst->src[4]; // [n_tokens] F32
+    const ggml_tensor * bias    = dst->src[5]; // [n_vocab] F32, may be null
 
     GGML_ASSERT(dst->buffer != nullptr);
     GGML_ASSERT(ggml_is_contiguous(w));
@@ -13154,6 +13214,7 @@ static void ggml_vk_fused_sparse_ce_back(ggml_backend_vk_context * ctx, vk_conte
         (uint32_t) w->ne[1],
         (uint32_t) (h->nb[1] / sizeof(float)),
         (uint32_t) (dst->nb[1] / sizeof(float)),
+        bias != nullptr ? 1u : 0u,
     };
 
     const vk_subbuffer count_buf = ggml_vk_fused_sparse_ce_count(ctx, subctx, targets, weights, pc);
@@ -13162,11 +13223,13 @@ static void ggml_vk_fused_sparse_ce_back(ggml_backend_vk_context * ctx, vk_conte
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
+    // See the forward for why a null bias still gets a binding.
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, grad), ggml_vk_tensor_subbuffer(ctx, h),
           ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, targets),
           ggml_vk_tensor_subbuffer(ctx, weights), count_buf,
-          ggml_vk_tensor_subbuffer(ctx, dst) },
+          ggml_vk_tensor_subbuffer(ctx, dst),
+          ggml_vk_tensor_subbuffer(ctx, bias ? bias : weights) },
         pc, { pc.n_tokens, 1, 1 });
 }
 
@@ -13854,6 +13917,35 @@ static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, 
 static void ggml_vk_soft_max_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     float * op_params = (float *)dst->op_params;
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SOFT_MAX_BACK, { (uint32_t)src0->ne[0], (uint32_t)ggml_nrows(src0), op_params[0], op_params[1], 0.0f, 0.0f });
+}
+
+// retro delta: dense cross-entropy loss forward. One workgroup per row reduces
+// the row and atomically adds its contribution to the scalar dst, so the op needs
+// no scratch at all — but it does need dst zeroed first, which is why it does not
+// go through ggml_vk_op_f32 like the backward does.
+static void ggml_vk_cross_entropy_loss(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // src0 = logits, src1 = labels, dst = scalar loss. nactive follows the same
+    // host-side convention as the backward: op_params[1] flags an explicit count
+    // in op_params[0], else every row counts (matching the CPU/Metal reference).
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    const uint32_t nrows   = (uint32_t)ggml_nrows(src0);
+    const int32_t  nactive = dst->op_params[1] ? dst->op_params[0] : (int32_t)nrows;
+
+    vk_pipeline pipeline = ctx->device->pipeline_cross_entropy_loss_f32;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    // Command-buffer fill, not a deferred host memset -- see ggml_vk_buffer_fill_cmd.
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    ggml_vk_buffer_fill_cmd(subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const vk_op_push_constants pc = { (uint32_t)src0->ne[0], nrows, (float)nactive, 0.0f, 0.0f, 0.0f };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, src1), dst_buf },
+        pc, ggml_vk_row_workgroups(nrows));
 }
 
 static void ggml_vk_cross_entropy_loss_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
@@ -15912,6 +16004,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_SOFT_MAX_BACK:
         ggml_vk_soft_max_back(ctx, compute_ctx, src0, src1, node);
+
+        break;
+    case GGML_OP_CROSS_ENTROPY_LOSS: // retro delta
+        ggml_vk_cross_entropy_loss(ctx, compute_ctx, src0, src1, node);
 
         break;
     case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
@@ -18525,7 +18621,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_BACK:
             {
-                if (device->subgroup_size != 32) {
+                // retro delta: a 32-wide subgroup, native or requested through
+                // VK_EXT_subgroup_size_control. Gating on the native size alone used
+                // to send the entire backward to the CPU on AMD in wave64.
+                if (!device->fa_back_subgroup32) {
                     return false;
                 }
                 const ggml_tensor * q     = op->src[0];
@@ -18552,7 +18651,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (mask && (mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask))) {
                     return false;
                 }
-                if (sinks && sinks->type != GGML_TYPE_F32) {
+                // retro delta: attention sinks are accepted, and unlike CUDA and
+                // Metal that acceptance is now backed by a probe
+                // (flash_attn_back_vulkan_matches_cpu_with_attention_sinks) — the
+                // project rule is that a supports_op only advertises what a probe
+                // exercises. See docs/backends/UNIFY.md 6.9.
+                if (sinks && (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks))) {
                     return false;
                 }
                 if (q->ne[0] > VK_FA_BACK_MAX_D || v->ne[0] > VK_FA_BACK_MAX_D ||
@@ -18840,6 +18944,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_SOFT_MAX_BACK:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32
                 && ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+            // retro delta: dense CE forward. The scalar loss is summed with buffer
+            // F32 atomic adds, so a device without that extension keeps falling
+            // back to the CPU rather than getting a wrong answer.
+            return device->buffer_float32_atomic_add
+                && op->type == GGML_TYPE_F32 && ggml_is_scalar(op)
+                && ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32
+                && ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32
+                && ggml_are_same_shape(op->src[0], op->src[1]);
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             return op->type == GGML_TYPE_F32
                 && op->src[0]->type == GGML_TYPE_F32
@@ -19023,12 +19136,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (!h || !w || !targets || !weights) {
                     return false;
                 }
-                // retro delta: the Vulkan kernels do not implement the optional
-                // per-vocab bias yet (see ggml_fused_sparse_ce). Reject explicitly
-                // rather than silently dropping it — ggml_backend_sched must not
-                // schedule this node here when a bias is present.
+                // retro delta: the optional per-vocab bias is supported (it shifts
+                // every logit inside w_dot_h, in both directions), so Vulkan now
+                // sits with CUDA and Metal rather than refusing the node — see
+                // docs/backends/UNIFY.md 2.2. It must be a contiguous F32 vector
+                // covering the vocabulary, which is what ggml_fused_sparse_ce asserts.
                 if (bias != nullptr) {
-                    return false;
+                    if (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) ||
+                        bias->ne[0] != w->ne[1] || ggml_nrows(bias) != 1) {
+                        return false;
+                    }
                 }
                 if (back && (op->src[0] == nullptr || op->src[0]->type != GGML_TYPE_F32)) {
                     return false; // grad scalar
