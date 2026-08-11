@@ -4285,6 +4285,7 @@ bool llama_context::opt_step_packed_sequences(
         uint32_t                 n_tokens,
         size_t                   n_seq_ids,
         uint32_t                 n_sequences,
+        uint32_t                 accumulation_steps,
         ggml_opt_epoch_callback  callback) {
     GGML_ASSERT(opt_ctx);
     if (!tokens || !labels_sparse || !label_weights || !positions ||
@@ -4292,9 +4293,13 @@ bool llama_context::opt_step_packed_sequences(
             n_tokens == 0 || n_tokens != this->n_ubatch() ||
             n_seq_ids < n_tokens || n_sequences == 0 ||
             seq_offsets[0] != 0 || seq_offsets[n_tokens] != n_seq_ids ||
-            n_sequences > cparams.n_seq_max) {
+            n_sequences > cparams.n_seq_max || accumulation_steps == 0) {
         return false;
     }
+
+    // Opens the accumulation transaction on its first physical graph. Calls
+    // inside that transaction retain the period because opt_i is non-zero.
+    ggml_opt_set_period(opt_ctx, (int32_t) accumulation_steps);
 
     llama_batch batch = llama_batch_init(n_tokens, 0, n_sequences);
     batch.n_tokens = static_cast<int32_t>(n_tokens);
@@ -4336,7 +4341,7 @@ bool llama_context::opt_step_packed_sequences(
             LLAMA_LOG_ERROR("%s: output reserve failed\n", __func__);
             break;
         }
-        auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
+        auto mctx = memory->init_batch_packed(*balloc, cparams.n_ubatch);
         if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: memory batch initialization failed\n", __func__);
             break;
@@ -4438,7 +4443,7 @@ bool llama_context::opt_step_packed_sequences(
                 ggml_opt_prepare_alloc(opt_ctx, opt_cached_compute_ctx.get(), gf_fused,
                         res->get_inp_tokens(), fused_loss);
             } else {
-                ggml_opt_prepare_alloc(opt_ctx, opt_cached_compute_ctx.get(), gf,
+            ggml_opt_prepare_alloc(opt_ctx, opt_cached_compute_ctx.get(), gf,
                         res->get_inp_tokens(), res->get_logits());
             }
             if (!gradient_checkpoints.empty()) {
@@ -4537,6 +4542,12 @@ bool llama_context::opt_step_packed_sequences(
         ok = true;
     } while (false);
 
+    if (!ok) {
+        // A failed physical pass must not leak a partial reward-group gradient
+        // into the next logical update.
+        ggml_opt_cancel(opt_ctx);
+        ggml_opt_abort_accumulation(opt_ctx);
+    }
     memory->clear(true);
     llama_batch_free(batch);
     return ok;
@@ -5422,9 +5433,11 @@ bool llama_opt_step_packed_sequences(
         uint32_t                  n_tokens,
         size_t                    n_seq_ids,
         uint32_t                  n_sequences,
+        uint32_t                  accumulation_steps,
         ggml_opt_epoch_callback   callback) {
     return ctx->opt_step_packed_sequences(dataset, result, tokens, labels, label_weights,
-            positions, seq_offsets, seq_ids, n_tokens, n_seq_ids, n_sequences, callback);
+            positions, seq_offsets, seq_ids, n_tokens, n_seq_ids, n_sequences,
+            accumulation_steps, callback);
 }
 
 void llama_opt_get_timing(
